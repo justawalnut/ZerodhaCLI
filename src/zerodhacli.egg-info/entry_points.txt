@@ -1,0 +1,2 @@
+[console_scripts]
+zerodhacli = zerodhacli.__main__:app
