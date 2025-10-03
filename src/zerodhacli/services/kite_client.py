@@ -48,8 +48,7 @@ class KiteRESTClient:
     async def delete(self, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         async with self._lock:
             headers = await self._headers()
-            headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
-            response = await self._client.delete(path, data=payload, headers=headers)
+            response = await self._client.delete(path, params=payload, headers=headers)
         response.raise_for_status()
         return response.json()
 

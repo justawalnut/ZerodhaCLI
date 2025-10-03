@@ -211,16 +211,18 @@ class CommandDispatcher:
     def do_cancel(self, args: Sequence[str]) -> int:
         if not args:
             raise CommandError("Usage: cancel ORDERID | cancel all")
+        open_orders = _run(self.services.orders.list_open_orders())
         if len(args) == 1 and args[0].lower() == "all":
-            open_orders = _run(self.services.orders.list_open_orders())
             if not open_orders:
                 console.print("No open orders to cancel.")
                 return 0
-            responses = _run(self.services.orders.cancel_orders([order.order_id for order in open_orders]))
+            responses = _run(self.services.orders.cancel_orders(open_orders))
             self._render_cancelled(responses)
             return 0
         order_id = args[0]
-        responses = _run(self.services.orders.cancel_orders([order_id]))
+        match = next((order for order in open_orders if order.order_id == order_id), None)
+        variety = match.variety if match is not None else None
+        responses = _run(self.services.orders.cancel_orders([(order_id, variety)]))
         self._render_cancelled(responses)
         return 0
 
@@ -296,7 +298,7 @@ class CommandDispatcher:
             positions = _run(self.services.portfolio.positions())
             positions = list(positions)
             try:
-                _run(self.services.quotes.enrich_positions(positions))
+                _run(self.services.quotes.enrich_positions(positions, force=True))
             except httpx.HTTPError as exc:
                 console.print(f"[yellow]Warning[/yellow]: quote lookup failed ({exc}).")
         positions = list(positions)
@@ -325,7 +327,7 @@ class CommandDispatcher:
 
     def do_history(self, args: Sequence[str]) -> int:
         limit = self._parse_int(args[0], "count", minimum=1) if args else 10
-        records = self.services.orders.recent_history(limit)
+        records = _run(self.services.orders.recent_history(limit))
         ts = _timestamp()
         mode = _mode_tag(self.services.config)
         console.print(f"[{ts}] {mode} HISTORY (last {limit})")

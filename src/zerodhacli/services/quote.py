@@ -34,12 +34,23 @@ class QuoteService:
             result[key] = float(price)
         return result
 
-    async def enrich_positions(self, positions: Iterable[Position]) -> None:
-        """Attach last_price to positions lacking it."""
+    async def enrich_positions(self, positions: Iterable[Position], *, force: bool = False) -> None:
+        """Attach or refresh last_price values for the provided positions."""
 
-        missing = [f"{p.exchange}:{p.tradingsymbol}" for p in positions if p.last_price is None]
-        mapping = await self.ltp(missing)
-        for position in positions:
+        snapshot = list(positions)
+        keys = []
+        if force:
+            keys = [f"{p.exchange}:{p.tradingsymbol}" for p in snapshot]
+        else:
+            keys = [f"{p.exchange}:{p.tradingsymbol}" for p in snapshot if p.last_price is None]
+
+        keys = list(dict.fromkeys(keys))
+
+        if not keys:
+            return
+
+        mapping = await self.ltp(keys)
+        for position in snapshot:
             key = f"{position.exchange}:{position.tradingsymbol}"
-            if position.last_price is None and key in mapping:
+            if key in mapping:
                 position.last_price = mapping[key]

@@ -12,7 +12,16 @@ from typing import Any, Iterable, List, Optional, Sequence, Tuple
 import json
 
 from ..core.config import AppConfig
-from ..core.models import OrderRequest, OrderResponse, OrderSummary, OrderType, Position, Product, Variety
+from ..core.models import (
+    OrderRequest,
+    OrderResponse,
+    OrderSummary,
+    OrderType,
+    Position,
+    Product,
+    Validity,
+    Variety,
+)
 from ..core.rate_limit import AsyncRateLimiter
 from .kite_client import KiteRESTClient
 from .portfolio import PortfolioService
@@ -105,9 +114,25 @@ class OrderRouter:
         data = await self._client.put(f"/orders/regular/{order_id}", self._serialize(updates))
         return OrderResponse(order_id=order_id, status=data.get("status", ""))
 
-    async def cancel_orders(self, order_ids: Iterable[str]) -> List[OrderResponse]:
+    async def cancel_orders(
+        self,
+        orders: Iterable[OrderSummary | Tuple[str, Optional[Variety | str]] | str],
+    ) -> List[OrderResponse]:
         responses: List[OrderResponse] = []
-        for order_id in order_ids:
+        parsed: List[Tuple[str, Optional[Variety | str]]] = []
+
+        for item in orders:
+            if isinstance(item, OrderSummary):
+                parsed.append((item.order_id, item.variety))
+                continue
+            if isinstance(item, tuple):
+                order_id = str(item[0])
+                variety = item[1] if len(item) > 1 else None
+                parsed.append((order_id, variety))
+                continue
+            parsed.append((str(item), None))
+
+        for order_id, variety in parsed:
             await self._throttle()
             if self._config.dry_run:
                 if order_id in self._dry_orders:
@@ -115,16 +140,52 @@ class OrderRouter:
                     del self._dry_orders[order_id]
                 responses.append(OrderResponse(order_id=order_id, status="dry-run"))
                 continue
-            data = await self._client.delete(f"/orders/regular/{order_id}")
+            variety_token = self._variety_token(variety)
+            data = await self._client.delete(f"/orders/{variety_token}/{order_id}")
             responses.append(OrderResponse(order_id=order_id, status=data.get("status", "")))
         return responses
 
-    def recent_history(self, limit: int = 10) -> List[ExecutionRecord]:
-        """Return the most recent execution records captured locally."""
+    async def recent_history(self, limit: int = 10) -> List[ExecutionRecord]:
+        """Return recent execution records combining session and API data."""
 
         if limit <= 0:
             return []
-        return list(self._history[-limit:])
+
+        local = list(self._history[-limit:])
+
+        if self._config.dry_run:
+            return local
+
+        remote_records: List[ExecutionRecord] = []
+        try:
+            payload = await self._client.get("/orders")
+        except Exception:  # pragma: no cover - network failure fallback
+            payload = {}
+
+        entries = payload.get("data", []) if isinstance(payload, dict) else []
+        for entry in entries:
+            record = self._record_from_payload(entry)
+            if record is not None:
+                remote_records.append(record)
+
+        combined = local + remote_records
+        if not combined:
+            return []
+
+        combined.sort(key=lambda record: record.timestamp)
+        deduped: List[ExecutionRecord] = []
+        seen: set[Tuple[str, datetime]] = set()
+
+        for record in reversed(combined):
+            key = (record.response.order_id, record.timestamp)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(record)
+            if len(deduped) == limit:
+                break
+
+        return list(reversed(deduped))
 
     def simulated_positions(self) -> List[Position]:
         """Project current positions using dry-run executions."""
@@ -305,6 +366,56 @@ class OrderRouter:
         if len(self._history) > 500:
             self._history.pop(0)
 
+    def _record_from_payload(self, entry: dict[str, Any]) -> Optional[ExecutionRecord]:
+        order_id = entry.get("order_id")
+        if not order_id:
+            return None
+
+        order_type_raw = entry.get("order_type")
+        product_raw = entry.get("product", Product.MIS.value)
+        variety_raw = entry.get("variety", Variety.REGULAR.value)
+        validity_raw = entry.get("validity", Validity.DAY.value)
+
+        try:
+            order_type = OrderType(order_type_raw) if order_type_raw else OrderType.MARKET
+        except ValueError:
+            order_type = OrderType.MARKET
+
+        try:
+            product = Product(product_raw) if isinstance(product_raw, str) else product_raw
+        except ValueError:
+            product = Product.MIS
+
+        try:
+            variety = Variety(variety_raw) if isinstance(variety_raw, str) else variety_raw
+        except ValueError:
+            variety = Variety.REGULAR
+
+        try:
+            validity = Validity(validity_raw) if isinstance(validity_raw, str) else validity_raw
+        except ValueError:
+            validity = Validity.DAY
+
+        price_value = entry.get("price")
+        trigger_value = entry.get("trigger_price")
+
+        request = OrderRequest(
+            tradingsymbol=entry.get("tradingsymbol", ""),
+            exchange=entry.get("exchange", ""),
+            transaction_type=str(entry.get("transaction_type", "")).upper(),
+            quantity=int(entry.get("quantity", 0)),
+            order_type=order_type,
+            product=product,
+            price=float(price_value) if price_value is not None else None,
+            trigger_price=float(trigger_value) if trigger_value is not None else None,
+            validity=validity,
+            variety=variety,
+        )
+
+        response = OrderResponse(order_id=str(order_id), status=str(entry.get("status", "")))
+        timestamp = self._parse_timestamp(entry.get("order_timestamp"))
+        return ExecutionRecord(request=request, response=response, timestamp=timestamp)
+
     def _update_sim_position(self, order: OrderRequest) -> None:
         key = f"{order.exchange}:{order.tradingsymbol}"
         current = self._sim_positions.get(
@@ -367,6 +478,14 @@ class OrderRouter:
         remainder = abs(qty) - abs(current_qty)
         residual_qty = trade_sign * remainder
         return residual_qty, trade_value
+
+    @staticmethod
+    def _variety_token(variety: Optional[Variety | str]) -> str:
+        if isinstance(variety, Variety):
+            return variety.value
+        if isinstance(variety, str) and variety:
+            return variety.lower()
+        return Variety.REGULAR.value
 
     @staticmethod
     def _serialize(payload: dict[str, Any]) -> dict[str, Any]:
