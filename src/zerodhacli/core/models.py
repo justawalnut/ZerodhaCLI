@@ -94,6 +94,7 @@ class Position:
     quantity: int
     average_price: float
     pnl: float
+    last_price: Optional[float] = None
 
 
 @dataclass(slots=True)

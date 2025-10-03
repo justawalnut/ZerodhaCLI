@@ -29,10 +29,10 @@ class AppConfig:
 
     creds: KiteCredentials = field(default_factory=KiteCredentials)
     root_url: str = "https://api.kite.trade"
-    dry_run: bool = True
+    dry_run: bool = False
     default_product: str = "MIS"
     market_protection: float = 2.5
-    autoslice: bool = True
+    autoslice: bool = False
     throttle_warning_threshold: float = 0.8
 
     @classmethod

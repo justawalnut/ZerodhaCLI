@@ -1,13 +1,17 @@
-"""Entry point for the ZerodhaCLI Typer application."""
+"""Entry point for the ZerodhaCLI application."""
 
-from .cli.app import app
+from __future__ import annotations
+
+import sys
+
+from .cli.app import run_cli
 
 
-def main() -> None:
-    """Run the ZerodhaCLI application."""
+def main() -> int:
+    """Run the ZerodhaCLI command dispatcher."""
 
-    app()
+    return run_cli()
 
 
 if __name__ == "__main__":  # pragma: no cover
-    main()
+    sys.exit(main())

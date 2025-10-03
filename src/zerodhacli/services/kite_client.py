@@ -31,19 +31,25 @@ class KiteRESTClient:
 
     async def post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         async with self._lock:
-            response = await self._client.post(path, json=payload, headers=await self._headers())
+            headers = await self._headers()
+            headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+            response = await self._client.post(path, data=payload, headers=headers)
         response.raise_for_status()
         return response.json()
 
     async def put(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         async with self._lock:
-            response = await self._client.put(path, json=payload, headers=await self._headers())
+            headers = await self._headers()
+            headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+            response = await self._client.put(path, data=payload, headers=headers)
         response.raise_for_status()
         return response.json()
 
     async def delete(self, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         async with self._lock:
-            response = await self._client.delete(path, json=payload, headers=await self._headers())
+            headers = await self._headers()
+            headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+            response = await self._client.delete(path, data=payload, headers=headers)
         response.raise_for_status()
         return response.json()
 

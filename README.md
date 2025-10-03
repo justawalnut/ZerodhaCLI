@@ -2,24 +2,58 @@
 
 Command-driven trading terminal inspired by Insilico Terminal, targeting Zerodha's Kite Connect APIs.
 
-This repo currently contains the application skeleton, core module contracts, and CLI scaffolding. Implementation work focuses on respecting Kite Connect's rate limits, product constraints, and workflows outlined in `info.md`.
+Launch `z` to drop into an interactive shell that prints a ZerodhaCLI banner and
+accepts trading mnemonics (`buy`, `sell`, `sl`, `scale`, …). Every session runs
+an integrity check before bootstrapping Zerodha services so you know whether the
+local config has drifted.
 
 ## Getting started
 
 1. Create a Python 3.10+ virtual environment.
 2. Install the package in editable mode: `pip install -e .[dev]`.
-3. Populate a local `.env` (or export environment variables) with your Kite credentials: `KITE_API_KEY`, `KITE_API_SECRET`, `KITE_ACCESS_TOKEN`, optionally `KITE_PUBLIC_TOKEN` and `KITE_USER_ID`. The CLI automatically loads these on startup.
-4. Review `info.md` for Zerodha-specific guardrails before integrating live credentials.
+3. Populate a local `.env` (or export environment variables) with your Kite
+   credentials: `KITE_API_KEY`, `KITE_API_SECRET`, `KITE_ACCESS_TOKEN`,
+   optionally `KITE_PUBLIC_TOKEN` and `KITE_USER_ID`. The CLI automatically
+   loads these on startup.
+4. Run the shell: `z --dry-run` is recommended for the first run. Without the
+   flag the CLI defaults to **live** mode and will reach the Kite APIs. ZerodhaCLI
+   persists overrides in `~/.config/zerodhacli/config.json` — for example:
 
-## Implemented commands
+   ```json
+   {
+     "dry_run": false,
+     "default_product": "MIS",
+     "market_protection": 2.5,
+     "autoslice": false
+   }
+   ```
 
-- `buy` / `sell`: market or limit entry with configurable product/variety.
-- `stop`: place SL / SL-M orders with trigger + optional limit price.
-- `cancel`: cancel by id or filter (`--side`, `--count`, `--latest`, `--all`).
-- `close`: flatten an open position retrieved from the portfolio API.
-- `scale`: ladder limit orders between two prices.
-- `chase`: adjust a limit order toward a target with tick cadence.
-- `swarm`: burst child orders splitting total quantity.
-- `gtt` subcommands: `single`, `oco`, `list`, `delete` for server-side triggers.
+## Command palette
 
-Commands start in dry-run mode, so nothing hits Zerodha until you supply `--live` when launching the CLI. Use `zerodhacli --live ...` only once you are comfortable with the workflows and ready to trade with real funds. See `docs/USAGE.md` for a quick reference covering every command.
+Once the shell banner appears you can issue commands exactly as they are
+documented below. Prepend `z` from your system shell for one-off calls (e.g.
+`z buy INFY 1 @1540`).
+
+| Action | Syntax |
+| --- | --- |
+| Market / limit entry | `buy SYMBOL QTY [@PRICE]`, `sell SYMBOL QTY [@PRICE]` |
+| Stop-loss | `sl SYMBOL QTY TRIGGER [PRICE]` (omit PRICE for SL-M) |
+| Flatten | `close SYMBOL` (accepts `EXCHANGE:SYMBOL` or raw tradingsymbol) |
+| Cancel | `cancel ORDERID` or `cancel all` |
+| Ladder | `scale SYMBOL QTY START END COUNT` |
+| Chase | `chase SYMBOL QTY PRICE MAX_MOVES TICK` |
+| Blotters | `orders`, `pos`, `history [N]`, `help`, `quit` |
+
+`pos` displays per-instrument mark price, unrealised PnL, and the summed day PnL
+using live quotes (or simulated marks in dry-run).
+
+Every execution logs two lines:
+
+```
+[2025-10-03 10:20:11] SIM BUY 1 AUBANK @₹850.00 -> order_id=DRY-72e6692350b5
+status=dry-run
+```
+
+Live mode replaces `SIM` with `LIVE` and surfaces real Kite order ids/statuses.
+
+See `docs/USAGE.md` for a narrative walkthrough of the session flow.

@@ -1,5 +1,5 @@
-"""CLI package."""
+"""CLI package exports."""
 
-from .app import app  # re-export
+from .app import run_cli, run_repl
 
-__all__ = ["app"]
+__all__ = ["run_cli", "run_repl"]

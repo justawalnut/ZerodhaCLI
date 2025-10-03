@@ -7,7 +7,9 @@ import itertools
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import Iterable, List, Optional, Sequence
+from enum import Enum
+from typing import Any, Iterable, List, Optional, Sequence, Tuple
+import json
 
 from ..core.config import AppConfig
 from ..core.models import OrderRequest, OrderResponse, OrderSummary, OrderType, Position, Product, Variety
@@ -24,6 +26,38 @@ class _DryOrderRecord:
     average_price: Optional[float] = None
 
 
+@dataclass(slots=True)
+class ExecutionRecord:
+    """Captures a single order placement acknowledgement."""
+
+    request: OrderRequest
+    response: OrderResponse
+    timestamp: datetime
+
+
+@dataclass(slots=True)
+class _SimPosition:
+    """Lightweight accumulator for dry-run position state."""
+
+    tradingsymbol: str
+    exchange: str
+    product: Product
+    quantity: int = 0
+    average_price: float = 0.0
+    mark_price: Optional[float] = None
+
+    def to_position(self) -> Position:
+        return Position(
+            tradingsymbol=self.tradingsymbol,
+            exchange=self.exchange,
+            product=self.product,
+            quantity=self.quantity,
+            average_price=self.average_price,
+            pnl=0.0,
+            last_price=self.mark_price,
+        )
+
+
 class OrderRouter:
     """Places and manages orders while respecting config and rate limits."""
 
@@ -33,6 +67,8 @@ class OrderRouter:
         self._portfolio = portfolio
         self._rate_limiter = AsyncRateLimiter(per_second=10, per_minute=200)
         self._dry_orders: dict[str, _DryOrderRecord] = {}
+        self._history: list[ExecutionRecord] = []
+        self._sim_positions: dict[str, _SimPosition] = {}
 
     async def _throttle(self) -> None:
         if not self._config.dry_run:
@@ -44,11 +80,17 @@ class OrderRouter:
         await self._throttle()
         if self._config.dry_run:
             order_id = f"DRY-{uuid.uuid4().hex[:12]}"
-            self._dry_orders[order_id] = _DryOrderRecord(request=order, created_at=datetime.utcnow())
-            return OrderResponse(order_id=order_id, status="dry-run")
-        payload = {k: v for k, v in asdict(order).items() if v is not None}
+            record = _DryOrderRecord(request=order, created_at=datetime.utcnow())
+            self._dry_orders[order_id] = record
+            response = OrderResponse(order_id=order_id, status="dry-run")
+            self._record_execution(order, response)
+            self._update_sim_position(order)
+            return response
+        payload = self._serialize(asdict(order))
         data = await self._client.post("/orders/regular", payload)
-        return OrderResponse(order_id=data.get("data", {}).get("order_id", ""), status=data.get("status", ""))
+        response = OrderResponse(order_id=data.get("data", {}).get("order_id", ""), status=data.get("status", ""))
+        self._record_execution(order, response)
+        return response
 
     async def modify_order(self, order_id: str, updates: dict) -> OrderResponse:
         await self._throttle()
@@ -60,7 +102,7 @@ class OrderRouter:
                 if hasattr(record.request, key):
                     setattr(record.request, key, value)
             return OrderResponse(order_id=order_id, status="dry-run")
-        data = await self._client.put(f"/orders/regular/{order_id}", updates)
+        data = await self._client.put(f"/orders/regular/{order_id}", self._serialize(updates))
         return OrderResponse(order_id=order_id, status=data.get("status", ""))
 
     async def cancel_orders(self, order_ids: Iterable[str]) -> List[OrderResponse]:
@@ -77,6 +119,18 @@ class OrderRouter:
             responses.append(OrderResponse(order_id=order_id, status=data.get("status", "")))
         return responses
 
+    def recent_history(self, limit: int = 10) -> List[ExecutionRecord]:
+        """Return the most recent execution records captured locally."""
+
+        if limit <= 0:
+            return []
+        return list(self._history[-limit:])
+
+    def simulated_positions(self) -> List[Position]:
+        """Project current positions using dry-run executions."""
+
+        return [snapshot.to_position() for snapshot in self._sim_positions.values()]
+
     async def close_position(self, position: Position, side: Optional[str] = None) -> OrderResponse:
         """Flatten the provided position."""
 
@@ -92,7 +146,7 @@ class OrderRouter:
             order_type=OrderType.MARKET,
             product=position.product,
             market_protection=self._config.market_protection,
-            autoslice=self._config.autoslice,
+            autoslice=self._config.autoslice or None,
         )
         return await self.place_order(order)
 
@@ -244,3 +298,93 @@ class OrderRouter:
                 except ValueError:
                     continue
         return datetime.utcnow()
+
+    def _record_execution(self, order: OrderRequest, response: OrderResponse) -> None:
+        entry = ExecutionRecord(request=order, response=response, timestamp=datetime.utcnow())
+        self._history.append(entry)
+        if len(self._history) > 500:
+            self._history.pop(0)
+
+    def _update_sim_position(self, order: OrderRequest) -> None:
+        key = f"{order.exchange}:{order.tradingsymbol}"
+        current = self._sim_positions.get(
+            key,
+            _SimPosition(tradingsymbol=order.tradingsymbol, exchange=order.exchange, product=order.product),
+        )
+
+        price = order.price
+        side = order.transaction_type.upper()
+        qty = order.quantity
+
+        new_qty, new_avg = self._apply_trade(current.quantity, current.average_price, side, qty, price)
+
+        if new_qty == 0:
+            if key in self._sim_positions:
+                del self._sim_positions[key]
+            return
+
+        current.quantity = new_qty
+        if price is not None or current.average_price == 0.0:
+            current.average_price = new_avg
+        if price is not None:
+            current.mark_price = price
+        current.product = order.product
+        self._sim_positions[key] = current
+
+    @staticmethod
+    def _apply_trade(
+        current_qty: int,
+        current_avg: float,
+        side: str,
+        qty: int,
+        price: Optional[float],
+    ) -> Tuple[int, float]:
+        """Update a running position based on a simulated fill."""
+
+        if qty <= 0:
+            return current_qty, current_avg
+
+        trade_sign = 1 if side == "BUY" else -1
+        trade_value = price if price is not None else current_avg
+        new_qty = current_qty + trade_sign * qty
+
+        if current_qty == 0:
+            return new_qty, trade_value
+
+        if (current_qty > 0 and trade_sign > 0) or (current_qty < 0 and trade_sign < 0):
+            # Increasing exposure in the same direction -> weighted average
+            if trade_value == 0.0:
+                return new_qty, current_avg
+            weighted = (abs(current_qty) * current_avg) + (qty * trade_value)
+            return new_qty, weighted / abs(new_qty)
+
+        # Reducing existing exposure or reversing direction
+        if abs(qty) < abs(current_qty):
+            return new_qty, current_avg
+        if abs(qty) == abs(current_qty):
+            return 0, 0.0
+        # Reversal: leftover position adopts the trade price
+        remainder = abs(qty) - abs(current_qty)
+        residual_qty = trade_sign * remainder
+        return residual_qty, trade_value
+
+    @staticmethod
+    def _serialize(payload: dict[str, Any]) -> dict[str, Any]:
+        wire: dict[str, Any] = {}
+        for key, value in payload.items():
+            if value is None:
+                continue
+            wire[key] = OrderRouter._to_wire(value)
+        return wire
+
+    @staticmethod
+    def _to_wire(value: Any) -> Any:
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, dict):
+            return json.dumps({k: OrderRouter._to_wire(v) for k, v in value.items() if v is not None})
+        if isinstance(value, list):
+            return json.dumps([OrderRouter._to_wire(item) for item in value])
+        return value

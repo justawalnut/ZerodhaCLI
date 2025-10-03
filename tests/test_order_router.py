@@ -10,15 +10,18 @@ class MockClient:
     def __init__(self) -> None:
         self.orders_response = {"data": []}
         self._order_counter = 0
+        self.last_payload = None
 
     async def post(self, path, payload):
         self._order_counter += 1
+        self.last_payload = payload
         return {
             "status": "success",
             "data": {"order_id": f"MOCK-{self._order_counter}", "payload": payload},
         }
 
     async def put(self, path, payload):
+        self.last_payload = payload
         return {"status": "success", "data": {"order_id": path.rsplit("/", 1)[-1], "payload": payload}}
 
     async def delete(self, path):
@@ -39,7 +42,8 @@ def _router(client: MockClient | None = None, dry_run: bool = False) -> OrderRou
 
 
 def test_place_order_uses_client_response():
-    router = _router()
+    client = MockClient()
+    router = _router(client)
 
     order = OrderRequest(
         tradingsymbol="TEST",
@@ -54,6 +58,8 @@ def test_place_order_uses_client_response():
 
     assert response.status == "success"
     assert response.order_id == "MOCK-1"
+    assert client.last_payload["exchange"] == "NFO"
+    assert client.last_payload["order_type"] == OrderType.MARKET.value
 
 
 def test_filter_and_cancel_orders_against_mock_payload():
@@ -125,3 +131,40 @@ def test_dry_run_generates_fake_ids():
 
     assert response.status == "dry-run"
     assert response.order_id.startswith("DRY-")
+
+
+def test_recent_history_and_sim_positions():
+    router = _router(dry_run=True)
+
+    first = OrderRequest(
+        tradingsymbol="TEST",
+        exchange="NFO",
+        transaction_type="BUY",
+        quantity=2,
+        order_type=OrderType.LIMIT,
+        product=Product.MIS,
+        price=100.0,
+    )
+    second = OrderRequest(
+        tradingsymbol="TEST",
+        exchange="NFO",
+        transaction_type="SELL",
+        quantity=1,
+        order_type=OrderType.LIMIT,
+        product=Product.MIS,
+        price=105.0,
+    )
+
+    asyncio.run(router.place_order(first))
+    asyncio.run(router.place_order(second))
+
+    history = router.recent_history(5)
+    assert len(history) == 2
+    assert history[-1].request.transaction_type == "SELL"
+
+    positions = router.simulated_positions()
+    assert len(positions) == 1
+    position = positions[0]
+    assert position.quantity == 1
+    assert position.tradingsymbol == "TEST"
+    assert position.last_price == 105.0

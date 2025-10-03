@@ -1,444 +1,547 @@
-"""Typer-based command layer for ZerodhaCLI."""
+"""Command dispatcher and interactive shell for ZerodhaCLI."""
 
 from __future__ import annotations
 
 import asyncio
+import shlex
+import sys
 import atexit
-from typing import List, Optional
+from dataclasses import dataclass
+from datetime import datetime
+from typing import List, Optional, Sequence, Tuple
 
-import typer
+import httpx
 from rich.console import Console
 
 from ..core.config import AppConfig
-from ..core.models import GTTLeg, GTTRequest, OrderRequest, OrderType, Product, Validity, Variety
+from ..core.models import OrderRequest, OrderType, Position, Product, Validity, Variety
 from ..services.container import ServiceContainer
+from ..utils.integrity import IntegrityReport, perform_integrity_check
 
 console = Console()
-app = typer.Typer(help="Trade on Zerodha Kite with Insilico-style ergonomics.")
-gtt_app = typer.Typer(help="Manage Zerodha GTT triggers.")
+
+BANNER = ""
+
+DEFAULT_EXCHANGE = "NSE"
+PROMPT = "z> "
+
+
+class CommandError(Exception):
+    """Raised when command parsing or validation fails."""
+
+
+_GLOBAL_LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(_GLOBAL_LOOP)
+
+
+def _shutdown_loop() -> None:
+    pending = [task for task in asyncio.all_tasks(_GLOBAL_LOOP) if not task.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        _GLOBAL_LOOP.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    _GLOBAL_LOOP.close()
+
+
+atexit.register(_shutdown_loop)
 
 
 def _run(coro):
-    return asyncio.run(coro)
+    return _GLOBAL_LOOP.run_until_complete(coro)
 
 
-def _mode_tag(dry_run: bool) -> str:
-    return "[yellow]SIM[/yellow]" if dry_run else "[green]LIVE[/green]"
+def _timestamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _format_price(order: OrderRequest) -> str:
-    if order.order_type == OrderType.MARKET:
-        return "market"
-    if order.price is None:
-        return "--"
-    return f"₹{order.price:.2f}"
+def _mode_tag(config: AppConfig) -> str:
+    return "SIM" if config.dry_run else "LIVE"
 
 
-def _render_order_result(services: ServiceContainer, order: OrderRequest, response, extra: Optional[str] = None) -> None:
-    trigger_text = f" trigger=₹{order.trigger_price:.2f}" if order.trigger_price is not None else ""
-    extra_text = f" {extra}" if extra else ""
-    console.print(
-        f"{_mode_tag(services.config.dry_run)} {order.transaction_type} {order.quantity} {order.tradingsymbol}"
-        f" ({order.exchange}) {_format_price(order)}{trigger_text}{extra_text}"
-        f" -> order_id={response.order_id} status={response.status}"
-    )
+def _format_price(order_type: OrderType, price: Optional[float]) -> str:
+    if order_type == OrderType.MARKET or price is None:
+        return "@market"
+    return f"@₹{price:.2f}"
 
 
-def _render_simple_status(services: ServiceContainer, action: str, response) -> None:
-    console.print(f"{_mode_tag(services.config.dry_run)} {action} -> order_id={response.order_id} status={response.status}")
+def _format_trigger(trigger: Optional[float]) -> str:
+    if trigger is None:
+        return ""
+    return f" trigger=₹{trigger:.2f}"
 
 
-def _register_cleanup(services: ServiceContainer) -> None:
-    def _cleanup() -> None:
+def _format_money(value: float) -> str:
+    sign = "-" if value < 0 else ""
+    return f"{sign}₹{abs(value):.2f}"
+
+
+def _print_integrity_report(report: IntegrityReport, config: AppConfig) -> None:
+    mode = _mode_tag(config)
+    ts = _timestamp()
+    status = "OK" if report.ok else "WARN"
+    digest_text = report.digest or "<empty>"
+    console.print(f"[{ts}] {mode} INTEGRITY {status} (config hash {digest_text})")
+    for issue in report.issues:
+        console.print(f"- {issue}")
+
+
+@dataclass(slots=True)
+class CliSession:
+    """Context manager for wiring services and integrity checks."""
+
+    services: ServiceContainer
+    integrity: IntegrityReport
+
+    @classmethod
+    def create(cls, dry_run_override: Optional[bool]) -> "CliSession":
+        overrides = {}
+        if dry_run_override is not None:
+            overrides["dry_run"] = dry_run_override
+        config = AppConfig.load(overrides)
+        services = ServiceContainer.build(config)
+        report = perform_integrity_check(services.config)
+        return cls(services=services, integrity=report)
+
+    def __enter__(self) -> "CliSession":
+        _print_integrity_report(self.integrity, self.services.config)
         try:
-            asyncio.run(services.aclose())
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            try:
-                loop.run_until_complete(services.aclose())
-            finally:
-                loop.close()
+            _run(self.services.bootstrap())
+        except Exception as exc:  # pragma: no cover - best-effort bootstrap
+            console.print(
+                f"[yellow]Warning[/yellow]: failed to bootstrap live services ({exc}). Proceeding without ticker."
+            )
+        return self
 
-    atexit.register(_cleanup)
-
-
-@app.callback()
-def main(
-    ctx: typer.Context,
-    dry_run: bool = typer.Option(True, "--dry-run/--live", help="Run orders in simulation mode (default) or hit the live Kite API."),
-) -> None:
-    """Initialise services and attach them to the CLI context."""
-
-    config = AppConfig.load({"dry_run": dry_run})
-    services = ServiceContainer.build(config)
-    ctx.obj = {"services": services}
-    _register_cleanup(services)
-    _run(services.bootstrap())
+    def __exit__(self, exc_type, exc, tb) -> None:
+        _run(self.services.aclose())
 
 
-@app.command()
-def buy(
-    ctx: typer.Context,
-    symbol: str = typer.Argument(..., help="Trading symbol, e.g. NIFTY24JUNFUT"),
-    quantity: int = typer.Argument(..., min=1),
-    price: Optional[float] = typer.Option(None, help="Limit price; if omitted, market order is used."),
-    exchange: str = typer.Option("NFO", help="Exchange segment."),
-    product: Product = typer.Option(Product.MIS, case_sensitive=False),
-    validity: Validity = typer.Option(Validity.DAY, case_sensitive=False),
-    variety: Variety = typer.Option(Variety.REGULAR, case_sensitive=False),
-) -> None:
-    """Place a buy order."""
+class CommandDispatcher:
+    """Parse and execute trading commands."""
 
-    services: ServiceContainer = ctx.obj["services"]
-    order_type = OrderType.MARKET if price is None else OrderType.LIMIT
-    order = OrderRequest(
-        tradingsymbol=symbol,
-        exchange=exchange,
-        transaction_type="BUY",
-        quantity=quantity,
-        order_type=order_type,
-        product=product,
-        price=price,
-        validity=validity,
-        variety=variety,
-        market_protection=services.config.market_protection,
-        autoslice=services.config.autoslice,
-    )
-    response = _run(services.orders.place_order(order))
-    _render_order_result(services, order, response)
+    def __init__(self, session: CliSession) -> None:
+        self.session = session
+        self.services = session.services
+        try:
+            self.default_product = Product(self.services.config.default_product)
+        except ValueError:
+            self.default_product = Product.MIS
 
+    def execute(self, tokens: Sequence[str]) -> int:
+        if not tokens:
+            return 0
+        if tokens[0].lower() == "z":
+            tokens = tokens[1:]
+            if not tokens:
+                return 0
+        command = tokens[0].lower()
+        handler = getattr(self, f"do_{command}", None)
+        if handler is None:
+            raise CommandError(f"Unknown command: {command}")
+        return handler(tokens[1:]) or 0
 
-@app.command()
-def sell(
-    ctx: typer.Context,
-    symbol: str = typer.Argument(...),
-    quantity: int = typer.Argument(..., min=1),
-    price: Optional[float] = typer.Option(None),
-    exchange: str = typer.Option("NFO"),
-    product: Product = typer.Option(Product.MIS, case_sensitive=False),
-    validity: Validity = typer.Option(Validity.DAY, case_sensitive=False),
-    variety: Variety = typer.Option(Variety.REGULAR, case_sensitive=False),
-) -> None:
-    """Place a sell order."""
+    def do_help(self, _: Sequence[str]) -> int:
+        console.print(
+            "Available commands: buy, sell, sl, close, cancel, scale, chase, orders, pos, history, help, quit"
+        )
+        console.print("Use --dry-run or --live when launching to toggle mode. Ctrl+D or 'quit' exits.")
+        return 0
 
-    services: ServiceContainer = ctx.obj["services"]
-    order_type = OrderType.MARKET if price is None else OrderType.LIMIT
-    order = OrderRequest(
-        tradingsymbol=symbol,
-        exchange=exchange,
-        transaction_type="SELL",
-        quantity=quantity,
-        order_type=order_type,
-        product=product,
-        price=price,
-        validity=validity,
-        variety=variety,
-        market_protection=services.config.market_protection,
-        autoslice=services.config.autoslice,
-    )
-    response = _run(services.orders.place_order(order))
-    _render_order_result(services, order, response)
+    def do_buy(self, args: Sequence[str]) -> int:
+        symbol, qty, order_type, price = self._parse_basic_order_args(args, "buy")
+        order = self._build_order(symbol, qty, "BUY", order_type, price)
+        response = _run(self.services.orders.place_order(order))
+        self._render_order(order, response)
+        return 0
 
+    def do_sell(self, args: Sequence[str]) -> int:
+        symbol, qty, order_type, price = self._parse_basic_order_args(args, "sell")
+        order = self._build_order(symbol, qty, "SELL", order_type, price)
+        response = _run(self.services.orders.place_order(order))
+        self._render_order(order, response)
+        return 0
 
-@app.command()
-def stop(
-    ctx: typer.Context,
-    symbol: str = typer.Argument(...),
-    quantity: int = typer.Argument(..., min=1),
-    trigger: float = typer.Option(..., help="Trigger price for the stop."),
-    price: Optional[float] = typer.Option(None, help="Limit price for SL; omit for SL-M."),
-    exchange: str = typer.Option("NFO"),
-    product: Product = typer.Option(Product.MIS, case_sensitive=False),
-    side: str = typer.Option("SELL", help="Side to place stop order (SELL/BUY)."),
-) -> None:
-    """Place a stop-loss order (SL or SL-M)."""
-
-    services: ServiceContainer = ctx.obj["services"]
-    order_type = OrderType.SL if price is not None else OrderType.SL_M
-    order = OrderRequest(
-        tradingsymbol=symbol,
-        exchange=exchange,
-        transaction_type=side.upper(),
-        quantity=quantity,
-        order_type=order_type,
-        product=product,
-        price=price,
-        trigger_price=trigger,
-    )
-    response = _run(services.orders.place_order(order))
-    _render_order_result(services, order, response, extra="[stop]")
-
-
-@app.command()
-def cancel(
-    ctx: typer.Context,
-    order_id: Optional[str] = typer.Option(None, "--id", help="Specific order id to cancel."),
-    all: bool = typer.Option(False, help="Cancel all matching open orders."),
-    side: Optional[str] = typer.Option(None, help="Filter open orders by BUY/SELL before cancellation."),
-    count: Optional[int] = typer.Option(None, help="Cancel at most N orders after filtering."),
-    latest: bool = typer.Option(False, help="Use most recent orders when selecting by count."),
-) -> None:
-    """Cancel one or more orders with Insilico-style scopes."""
-
-    services: ServiceContainer = ctx.obj["services"]
-    if order_id:
-        responses = _run(services.orders.cancel_orders([order_id]))
-        for resp in responses:
-            _render_simple_status(services, "CANCEL", resp)
-        return
-
-    if latest and all:
-        raise typer.BadParameter("--latest cannot be combined with --all; drop --latest or specify --count.")
-
-    selection_count = None if all else (count or 1)
-    matching = _run(services.orders.filter_orders(side=side, count=selection_count, latest=latest))
-    if not matching:
-        console.print("No matching open orders to cancel.")
-        return
-    responses = _run(services.orders.cancel_orders([order.order_id for order in matching]))
-    for resp in responses:
-        _render_simple_status(services, "CANCEL", resp)
-
-
-@app.command()
-def close(
-    ctx: typer.Context,
-    symbol: str = typer.Argument(..., help="Instrument to flatten, e.g. NFO:NIFTY24JUNFUT"),
-    side: Optional[str] = typer.Option(None, help="Override exit side (BUY/SELL)."),
-) -> None:
-    """Close the provided position."""
-
-    services: ServiceContainer = ctx.obj["services"]
-    positions = _run(services.portfolio.index_by_symbol())
-    if symbol not in positions:
-        console.print(f"No open position for {symbol}")
-        raise typer.Exit(code=1)
-    preview_order = OrderRequest(
-        tradingsymbol=positions[symbol].tradingsymbol,
-        exchange=positions[symbol].exchange,
-        transaction_type=side.upper() if side else ("BUY" if positions[symbol].quantity < 0 else "SELL"),
-        quantity=abs(positions[symbol].quantity),
-        order_type=OrderType.MARKET,
-        product=positions[symbol].product,
-        market_protection=services.config.market_protection,
-        autoslice=services.config.autoslice,
-    )
-    response = _run(services.orders.close_position(positions[symbol], side=side))
-    _render_order_result(services, preview_order, response, extra="[close]")
-
-
-@app.command()
-def scale(
-    ctx: typer.Context,
-    symbol: str = typer.Argument(...),
-    count: int = typer.Option(3, min=1, help="Number of ladder orders."),
-    start_price: float = typer.Option(..., help="Lower bound price."),
-    end_price: float = typer.Option(..., help="Upper bound price."),
-    side: str = typer.Option("BUY", help="Side to trade (BUY/SELL)."),
-    quantity: int = typer.Option(..., min=1),
-    exchange: str = typer.Option("NFO"),
-    product: Product = typer.Option(Product.MIS, case_sensitive=False),
-) -> None:
-    """Ladder limit orders between two prices."""
-
-    services: ServiceContainer = ctx.obj["services"]
-    order = OrderRequest(
-        tradingsymbol=symbol,
-        exchange=exchange,
-        transaction_type=side.upper(),
-        quantity=quantity,
-        order_type=OrderType.LIMIT,
-        product=product,
-        validity=Validity.DAY,
-    )
-    responses = _run(services.orders.scale_order(order, count, start_price, end_price))
-    step = (end_price - start_price) / max(count - 1, 1)
-    for idx, resp in enumerate(responses):
-        ladder_price = round(start_price + step * idx, 2)
-        child = OrderRequest(
+    def do_sl(self, args: Sequence[str]) -> int:
+        if len(args) < 3:
+            raise CommandError("Usage: sl SYMBOL QTY TRIGGER [PRICE]")
+        symbol = args[0]
+        quantity = self._parse_quantity(args[1])
+        trigger = self._parse_float(args[2], "trigger")
+        price = self._parse_optional_float(args[3]) if len(args) > 3 else None
+        order_type = OrderType.SL if price is not None else OrderType.SL_M
+        order = OrderRequest(
             tradingsymbol=symbol,
-            exchange=exchange,
-            transaction_type=side.upper(),
+            exchange=DEFAULT_EXCHANGE,
+            transaction_type="SELL",
+            quantity=quantity,
+            order_type=order_type,
+            product=self.default_product,
+            price=price,
+            trigger_price=trigger,
+            validity=Validity.DAY,
+            variety=Variety.REGULAR,
+        )
+        response = _run(self.services.orders.place_order(order))
+        self._render_order(order, response)
+        return 0
+
+    def do_close(self, args: Sequence[str]) -> int:
+        if not args:
+            raise CommandError("Usage: close SYMBOL")
+        symbol = args[0]
+        if self.services.config.dry_run:
+            positions = self.services.orders.simulated_positions()
+        else:
+            positions = _run(self.services.portfolio.positions())
+        match = self._select_position(positions, symbol)
+        if match is None:
+            raise CommandError(f"No open position for {symbol}")
+        response = _run(self.services.orders.close_position(match))
+        preview = OrderRequest(
+            tradingsymbol=match.tradingsymbol,
+            exchange=match.exchange,
+            transaction_type="BUY" if match.quantity < 0 else "SELL",
+            quantity=abs(match.quantity),
+            order_type=OrderType.MARKET,
+            product=match.product,
+        )
+        self._render_order(preview, response, extra="[close]")
+        return 0
+
+    def do_cancel(self, args: Sequence[str]) -> int:
+        if not args:
+            raise CommandError("Usage: cancel ORDERID | cancel all")
+        if len(args) == 1 and args[0].lower() == "all":
+            open_orders = _run(self.services.orders.list_open_orders())
+            if not open_orders:
+                console.print("No open orders to cancel.")
+                return 0
+            responses = _run(self.services.orders.cancel_orders([order.order_id for order in open_orders]))
+            self._render_cancelled(responses)
+            return 0
+        order_id = args[0]
+        responses = _run(self.services.orders.cancel_orders([order_id]))
+        self._render_cancelled(responses)
+        return 0
+
+    def do_scale(self, args: Sequence[str]) -> int:
+        if len(args) != 5:
+            raise CommandError("Usage: scale SYMBOL QTY START END COUNT")
+        symbol = args[0]
+        quantity = self._parse_quantity(args[1])
+        start = self._parse_float(args[2], "start")
+        end = self._parse_float(args[3], "end")
+        count = self._parse_int(args[4], "count", minimum=1)
+        template = OrderRequest(
+            tradingsymbol=symbol,
+            exchange=DEFAULT_EXCHANGE,
+            transaction_type="BUY",
             quantity=quantity,
             order_type=OrderType.LIMIT,
-            product=product,
-            price=ladder_price,
+            product=self.default_product,
             validity=Validity.DAY,
+            autoslice=self.services.config.autoslice or None,
         )
-        _render_order_result(services, child, resp, extra=f"[scale {idx + 1}/{count}]")
+        responses = _run(self.services.orders.scale_order(template, count, start, end))
+        self._render_scale(template, responses, start, end, count)
+        return 0
 
-
-@app.command()
-def chase(
-    ctx: typer.Context,
-    symbol: str = typer.Argument(...),
-    price: float = typer.Option(..., help="Starting limit price."),
-    quantity: int = typer.Option(..., min=1),
-    side: str = typer.Option("BUY", help="Side to trade (BUY/SELL)."),
-    max_moves: int = typer.Option(20, help="Maximum number of price adjustments."),
-    tick_size: float = typer.Option(0.05, help="Increment/decrement per chase step."),
-    target_price: Optional[float] = typer.Option(None, help="Target price ceiling/floor."),
-    exchange: str = typer.Option("NFO"),
-    product: Product = typer.Option(Product.MIS, case_sensitive=False),
-) -> None:
-    """Chase a limit order towards a target price."""
-
-    services: ServiceContainer = ctx.obj["services"]
-    order = OrderRequest(
-        tradingsymbol=symbol,
-        exchange=exchange,
-        transaction_type=side.upper(),
-        quantity=quantity,
-        order_type=OrderType.LIMIT,
-        product=product,
-        price=price,
-    )
-    response = _run(
-        services.orders.chase_order(
-            order,
-            max_moves=max_moves,
-            tick_size=tick_size,
-            target_price=target_price,
+    def do_chase(self, args: Sequence[str]) -> int:
+        if len(args) != 5:
+            raise CommandError("Usage: chase SYMBOL QTY PRICE MAX_MOVES TICK")
+        symbol = args[0]
+        quantity = self._parse_quantity(args[1])
+        price = self._parse_float(args[2], "price")
+        max_moves = self._parse_int(args[3], "max_moves", minimum=1)
+        tick = self._parse_float(args[4], "tick")
+        order = OrderRequest(
+            tradingsymbol=symbol,
+            exchange=DEFAULT_EXCHANGE,
+            transaction_type="BUY",
+            quantity=quantity,
+            order_type=OrderType.LIMIT,
+            product=self.default_product,
+            price=price,
+            autoslice=self.services.config.autoslice or None,
         )
-    )
-    _render_order_result(services, order, response, extra=f"[chase max_moves={max_moves}]")
-
-
-@app.command()
-def swarm(
-    ctx: typer.Context,
-    symbol: str = typer.Argument(...),
-    total_quantity: int = typer.Option(..., min=1, help="Total quantity to distribute across the swarm."),
-    count: int = typer.Option(3, min=1, help="Number of child orders."),
-    side: str = typer.Option("BUY", help="Side to trade (BUY/SELL)."),
-    price: Optional[float] = typer.Option(None, help="Limit price for each child; omit for MARKET."),
-    exchange: str = typer.Option("NFO"),
-    product: Product = typer.Option(Product.MIS, case_sensitive=False),
-) -> None:
-    """Burst a swarm of child orders with even sizing."""
-
-    services: ServiceContainer = ctx.obj["services"]
-    base, remainder = divmod(total_quantity, count)
-    if base == 0:
-        raise typer.BadParameter("Increase quantity or reduce count to allocate at least 1 lot per order.")
-    order_type = OrderType.MARKET if price is None else OrderType.LIMIT
-    children: List[OrderRequest] = []
-    for index in range(count):
-        child_qty = base + (1 if index < remainder else 0)
-        children.append(
-            OrderRequest(
-                tradingsymbol=symbol,
-                exchange=exchange,
-                transaction_type=side.upper(),
-                quantity=child_qty,
-                order_type=order_type,
-                product=product,
-                price=price,
+        response = _run(
+            self.services.orders.chase_order(
+                order,
+                max_moves=max_moves,
+                tick_size=tick,
             )
         )
-    responses = _run(services.orders.swarm(children))
-    for idx, resp in enumerate(responses):
-        _render_order_result(services, children[idx], resp, extra=f"[swarm {idx + 1}/{count}]")
+        self._render_order(order, response, extra=f"[chase max_moves={max_moves} tick={tick}]")
+        return 0
 
-
-@app.command()
-def config(ctx: typer.Context) -> None:
-    """Show the active configuration for this session."""
-
-    services: ServiceContainer = ctx.obj["services"]
-    console.print(services.config)
-
-
-@gtt_app.command("single")
-def gtt_single(
-    ctx: typer.Context,
-    symbol: str = typer.Argument(...),
-    exchange: str = typer.Option("NSE"),
-    trigger: float = typer.Option(..., help="Trigger price for the alert."),
-    limit_price: float = typer.Option(..., help="Limit price to place when triggered."),
-    quantity: int = typer.Option(..., min=1),
-    side: str = typer.Option("SELL", help="Side of the exit order."),
-    last_price: Optional[float] = typer.Option(None, help="Reference last price for the trigger."),
-) -> None:
-    """Create a single-leg GTT."""
-
-    services: ServiceContainer = ctx.obj["services"]
-    if services.config.dry_run:
-        console.print("[yellow]SIM[/yellow] GTT operations require --live mode; rerun with --live to hit Kite.")
-        return
-    payload = GTTRequest(
-        tradingsymbol=symbol,
-        exchange=exchange,
-        trigger_values=[trigger],
-        last_price=last_price,
-        orders=[
-            GTTLeg(
-                price=limit_price,
-                quantity=quantity,
-                order_type=OrderType.LIMIT,
-                transaction_type=side.upper(),
+    def do_orders(self, _: Sequence[str]) -> int:
+        open_orders = _run(self.services.orders.list_open_orders())
+        ts = _timestamp()
+        mode = _mode_tag(self.services.config)
+        console.print(f"[{ts}] {mode} OPEN ORDERS ({len(open_orders)})")
+        if not open_orders:
+            console.print("None")
+            return 0
+        for order in open_orders:
+            price = _format_price(OrderType.LIMIT if order.price else OrderType.MARKET, order.price)
+            console.print(
+                f"- {order.order_id}: {order.transaction_type} {order.quantity} {order.tradingsymbol} {price} status={order.status}"
             )
-        ],
-    )
-    response = _run(services.gtt.create_gtt(payload))
-    console.print(response)
+        return 0
+
+    def do_pos(self, _: Sequence[str]) -> int:
+        if self.services.config.dry_run:
+            positions = self.services.orders.simulated_positions()
+        else:
+            positions = _run(self.services.portfolio.positions())
+            positions = list(positions)
+            try:
+                _run(self.services.quotes.enrich_positions(positions))
+            except httpx.HTTPError as exc:
+                console.print(f"[yellow]Warning[/yellow]: quote lookup failed ({exc}).")
+        positions = list(positions)
+        ts = _timestamp()
+        mode = _mode_tag(self.services.config)
+        console.print(f"[{ts}] {mode} POSITIONS:")
+        if not positions:
+            console.print("None")
+            return 0
+        total_unrealized = 0.0
+        total_day = 0.0
+        for position in positions:
+            mark = position.last_price if position.last_price is not None else position.average_price
+            unrealized = (mark - position.average_price) * position.quantity
+            total_unrealized += unrealized
+            total_day += position.pnl
+            direction = "+" if position.quantity >= 0 else ""
+            mark_display = f"₹{mark:.2f}" if mark is not None else "--"
+            console.print(
+                f"- {position.exchange}:{position.tradingsymbol}: {direction}{position.quantity} @₹{position.average_price:.2f} "
+                f"mark={mark_display} pnl={_format_money(unrealized)} day={_format_money(position.pnl)}"
+            )
+        console.print(f"Unrealized PnL: {_format_money(total_unrealized)}")
+        console.print(f"Day PnL: {_format_money(total_day)}")
+        return 0
+
+    def do_history(self, args: Sequence[str]) -> int:
+        limit = self._parse_int(args[0], "count", minimum=1) if args else 10
+        records = self.services.orders.recent_history(limit)
+        ts = _timestamp()
+        mode = _mode_tag(self.services.config)
+        console.print(f"[{ts}] {mode} HISTORY (last {limit})")
+        if not records:
+            console.print("None")
+            return 0
+        for record in records:
+            price = _format_price(record.request.order_type, record.request.price)
+            stamp = record.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            console.print(
+                f"- {stamp} {record.response.order_id} {record.request.transaction_type} {record.request.quantity} {record.request.tradingsymbol} {price} status={record.response.status}"
+            )
+        return 0
+
+    def do_quit(self, _: Sequence[str]) -> int:
+        raise SystemExit(0)
+
+    # Parsing helpers -------------------------------------------------
+
+    def _parse_basic_order_args(
+        self, args: Sequence[str], action: str
+    ) -> Tuple[str, int, OrderType, Optional[float]]:
+        if len(args) < 2:
+            raise CommandError(f"Usage: {action} SYMBOL QTY [@PRICE]")
+        symbol = args[0]
+        quantity = self._parse_quantity(args[1])
+        price_token = args[2] if len(args) > 2 else None
+        order_type, price = self._parse_price_token(price_token)
+        return symbol, quantity, order_type, price
+
+    def _parse_price_token(self, token: Optional[str]) -> Tuple[OrderType, Optional[float]]:
+        if token is None:
+            return OrderType.MARKET, None
+        raw = token[1:] if token.startswith("@") else token
+        lowered = raw.lower()
+        if lowered in {"market", "mkt"}:
+            return OrderType.MARKET, None
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise CommandError("Invalid price token; expected @<number>") from exc
+        return OrderType.LIMIT, value
+
+    def _parse_quantity(self, token: str) -> int:
+        return self._parse_int(token, "quantity", minimum=1)
+
+    def _parse_int(self, token: str, label: str, *, minimum: int = 0) -> int:
+        try:
+            value = int(token)
+        except ValueError as exc:
+            raise CommandError(f"Invalid {label}; expected integer") from exc
+        if value < minimum:
+            raise CommandError(f"{label} must be >= {minimum}")
+        return value
+
+    def _parse_float(self, token: str, label: str) -> float:
+        try:
+            return float(token)
+        except ValueError as exc:
+            raise CommandError(f"Invalid {label}; expected number") from exc
+
+    def _parse_optional_float(self, token: str) -> Optional[float]:
+        if token.lower() in {"market", "mkt"}:
+            return None
+        return self._parse_float(token, "price")
+
+    def _build_order(
+        self,
+        symbol: str,
+        quantity: int,
+        side: str,
+        order_type: OrderType,
+        price: Optional[float],
+    ) -> OrderRequest:
+        autoslice = self.services.config.autoslice if self.services.config.autoslice else None
+        return OrderRequest(
+            tradingsymbol=symbol,
+            exchange=DEFAULT_EXCHANGE,
+            transaction_type=side.upper(),
+            quantity=quantity,
+            order_type=order_type,
+            product=self.default_product,
+            price=price,
+            validity=Validity.DAY,
+            variety=Variety.REGULAR,
+            market_protection=self.services.config.market_protection,
+            autoslice=autoslice,
+        )
+
+    def _render_order(self, order: OrderRequest, response) -> None:
+        ts = _timestamp()
+        mode = _mode_tag(self.services.config)
+        price = _format_price(order.order_type, order.price)
+        trigger = _format_trigger(order.trigger_price)
+        console.print(
+            f"[{ts}] {mode} {order.transaction_type} {order.quantity} {order.tradingsymbol} {price}{trigger} -> order_id={response.order_id}"
+        )
+        console.print(f"status={response.status}")
+
+    def _render_scale(
+        self,
+        template: OrderRequest,
+        responses: Sequence,
+        start: float,
+        end: float,
+        count: int,
+    ) -> None:
+        ts = _timestamp()
+        mode = _mode_tag(self.services.config)
+        order_ids = [resp.order_id for resp in responses]
+        statuses = {resp.status for resp in responses}
+        status_text = statuses.pop() if len(statuses) == 1 else str(list(statuses))
+        console.print(
+            f"[{ts}] {mode} SCALE {template.transaction_type} {template.quantity} {template.tradingsymbol} between {start}-{end} ({count} legs) -> order_ids={order_ids}"
+        )
+        console.print(f"status={status_text}")
+
+    def _render_cancelled(self, responses) -> None:
+        ts = _timestamp()
+        mode = _mode_tag(self.services.config)
+        order_ids = [resp.order_id for resp in responses]
+        console.print(f"[{ts}] {mode} CANCEL -> order_ids={order_ids}")
+        statuses = {resp.status for resp in responses}
+        status_text = statuses.pop() if len(statuses) == 1 else str(list(statuses))
+        console.print(f"status={status_text}")
+
+    def _select_position(self, positions: Sequence[Position], token: str) -> Optional[Position]:
+        token_upper = token.upper()
+        if ":" in token_upper:
+            for position in positions:
+                if f"{position.exchange}:{position.tradingsymbol}".upper() == token_upper:
+                    return position
+        else:
+            matches = [position for position in positions if position.tradingsymbol.upper() == token_upper]
+            if len(matches) == 1:
+                return matches[0]
+        return None
 
 
-@gtt_app.command("oco")
-def gtt_oco(
-    ctx: typer.Context,
-    symbol: str = typer.Argument(...),
-    exchange: str = typer.Option("NSE"),
-    trigger_up: float = typer.Option(..., help="Trigger that fires the profit-taking leg."),
-    trigger_down: float = typer.Option(..., help="Trigger that fires the stop leg."),
-    quantity: int = typer.Option(..., min=1),
-    price_up: float = typer.Option(..., help="Limit price for the profit leg."),
-    price_down: float = typer.Option(..., help="Limit price for the stop leg."),
-    side: str = typer.Option("SELL", help="Direction of the exit legs."),
-    last_price: Optional[float] = typer.Option(None),
-) -> None:
-    """Create a two-leg OCO GTT."""
-
-    services: ServiceContainer = ctx.obj["services"]
-    if services.config.dry_run:
-        console.print("[yellow]SIM[/yellow] GTT operations require --live mode; rerun with --live to hit Kite.")
-        return
-    payload = GTTRequest(
-        tradingsymbol=symbol,
-        exchange=exchange,
-        trigger_values=[trigger_up, trigger_down],
-        last_price=last_price,
-        orders=[
-            GTTLeg(price=price_up, quantity=quantity, order_type=OrderType.LIMIT, transaction_type=side.upper()),
-            GTTLeg(price=price_down, quantity=quantity, order_type=OrderType.LIMIT, transaction_type=side.upper()),
-        ],
-    )
-    response = _run(services.gtt.create_gtt(payload))
-    console.print(response)
+def _extract_mode_override(argv: Sequence[str]) -> Tuple[Optional[bool], List[str]]:
+    dry_run_override: Optional[bool] = None
+    remaining: List[str] = []
+    for arg in argv:
+        if arg == "--dry-run":
+            dry_run_override = True
+            continue
+        if arg == "--live":
+            dry_run_override = False
+            continue
+        if arg in {"-h", "--help"}:
+            return dry_run_override, ["help"]
+        remaining.append(arg)
+    return dry_run_override, remaining
 
 
-@gtt_app.command("list")
-def gtt_list(ctx: typer.Context) -> None:
-    """List existing GTT triggers."""
+def run_cli(argv: Optional[Sequence[str]] = None) -> int:
+    argv = list(argv if argv is not None else sys.argv[1:])
+    dry_run_override, remaining = _extract_mode_override(argv)
 
-    services: ServiceContainer = ctx.obj["services"]
-    if services.config.dry_run:
-        console.print("[yellow]SIM[/yellow] GTT operations require --live mode; rerun with --live to hit Kite.")
-        return
-    response = _run(services.gtt.list_gtts())
-    console.print(response)
+    if not remaining:
+        return run_repl(dry_run_override)
 
-
-@gtt_app.command("delete")
-def gtt_delete(ctx: typer.Context, trigger_id: int = typer.Argument(...)) -> None:
-    """Delete a GTT trigger by id."""
-
-    services: ServiceContainer = ctx.obj["services"]
-    if services.config.dry_run:
-        console.print("[yellow]SIM[/yellow] GTT operations require --live mode; rerun with --live to hit Kite.")
-        return
-    response = _run(services.gtt.delete_gtt(trigger_id))
-    console.print(response)
+    with CliSession.create(dry_run_override) as session:
+        dispatcher = CommandDispatcher(session)
+        try:
+            return dispatcher.execute(remaining)
+        except CommandError as exc:
+            console.print(f"Error: {exc}")
+            return 1
+        except httpx.HTTPStatusError as exc:
+            console.print(f"HTTP error {exc.response.status_code}: {exc.response.text}")
+            return 1
+        except httpx.HTTPError as exc:
+            console.print(f"HTTP error: {exc}")
+            return 1
 
 
-app.add_typer(gtt_app, name="gtt")
+def run_repl(dry_run_override: Optional[bool] = None) -> int:
+    with CliSession.create(dry_run_override) as session:
+        dispatcher = CommandDispatcher(session)
+        console.print(BANNER)
+        console.print("Type 'help' for available commands, 'quit' to exit.")
+        while True:
+            try:
+                raw = input(PROMPT)
+            except EOFError:
+                console.print("\nExited.")
+                return 0
+            except KeyboardInterrupt:
+                console.print("\nInterrupted. Type 'quit' to exit.")
+                continue
+            command_line = raw.strip()
+            if not command_line:
+                continue
+            try:
+                tokens = shlex.split(command_line)
+            except ValueError as exc:
+                console.print(f"Parse error: {exc}")
+                continue
+            if not tokens:
+                continue
+            if tokens[0].lower() in {"quit", "exit"}:
+                console.print("Bye.")
+                return 0
+            try:
+                dispatcher.execute(tokens)
+            except CommandError as exc:
+                console.print(f"Error: {exc}")
+            except SystemExit:
+                console.print("Bye.")
+                return 0
+            except httpx.HTTPStatusError as exc:
+                console.print(f"HTTP error {exc.response.status_code}: {exc.response.text}")
+            except httpx.HTTPError as exc:
+                console.print(f"HTTP error: {exc}")
+    return 0
+
+
+__all__ = ["run_cli", "run_repl"]

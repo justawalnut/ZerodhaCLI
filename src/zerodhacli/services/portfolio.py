@@ -29,6 +29,7 @@ class PortfolioService:
                         quantity=int(entry["quantity"]),
                         average_price=float(entry["average_price"]),
                         pnl=float(entry.get("pnl", 0.0)),
+                        last_price=float(entry.get("last_price")) if entry.get("last_price") is not None else None,
                     )
                 )
         return result

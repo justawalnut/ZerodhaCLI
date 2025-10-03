@@ -1,59 +1,64 @@
 # ZerodhaCLI Quickstart
 
-ZerodhaCLI defaults to **dry-run** mode so you can explore every workflow without
-submitting real orders. Pass `--live` on the root command only when you are ready
-to trade against Zerodha Kite.
+ZerodhaCLI now starts in **live** mode. Launch it with `--dry-run` when you want
+to simulate order flow without touching the Kite API.
 
 ```bash
-# Dry-run session (default)
-zerodhacli buy HDFCBANK 1 --exchange NSE
+# Practice session (simulated)
+z --dry-run
 
-# Live session
-zerodhacli --live buy HDFCBANK 1 --exchange NSE
+# One-off market order from your shell (live)
+z buy HDFCBANK 1
 ```
 
-Each command prints a single line indicating whether it ran in `SIM` (dry-run)
-or `LIVE` mode, followed by the order details and Kite response.
+Running `z` with no trailing command opens an interactive shell with ASCII-art
+banner, integrity report, and a prompt (`z> `). The same mnemonics work inside
+that shell or directly after the `z` binary.
 
-## Core order entry
+## Core actions
 
-| Command | Purpose | Example |
+| Action | Description | Example |
 | --- | --- | --- |
-| `buy SYMBOL QTY [--price P]` | Place market/limit buy | `zerodhacli buy HDFCBANK 1 --exchange NSE` |
-| `sell SYMBOL QTY [--price P]` | Place market/limit sell | `zerodhacli sell HDFCBANK 1 --price 1500 --exchange NSE` |
-| `stop` | Submit SL / SL-M | `zerodhacli stop HDFCBANK 1 --trigger 1490 --price 1491` |
-| `close EXCHANGE:SYMBOL` | Flatten an open position | `zerodhacli close NSE:HDFCBANK` |
-| `cancel` | Cancel orders by id or filters | `zerodhacli cancel --id DRY-12345abc`, `zerodhacli cancel --side BUY --count 2 --latest` |
+| `buy SYMBOL QTY [@PRICE]` | Market/limit buy (`@` omitted → market) | `z buy INFY 2 @1540.5` |
+| `sell SYMBOL QTY [@PRICE]` | Market/limit sell | `z sell NIFTY24OCTFUT 1` |
+| `sl SYMBOL QTY TRIGGER [PRICE]` | Stop-loss; skip PRICE for SL-M | `z sl HDFCBANK 1 1490 1491` |
+| `close SYMBOL` | Flatten open position; accepts `NSE:HDFCBANK` or `HDFCBANK` | `z close BANKNIFTY24OCTFUT` |
+| `cancel ORDERID` / `cancel all` | Cancel single order or everything open | `z cancel DRY-123abc` |
 
 ## Execution algos
 
-| Command | Description | Example |
+| Action | Description | Example |
 | --- | --- | --- |
-| `scale` | Spread limit orders between two prices | `zerodhacli scale HDFCBANK --start-price 1498 --end-price 1500 --count 3 --quantity 1 --exchange NSE` |
-| `chase` | Create + optionally chase a limit order | `zerodhacli chase HDFCBANK --price 1500 --quantity 1 --max-moves 5 --tick-size 0.5` |
-| `swarm` | Burst multiple child orders | `zerodhacli swarm HDFCBANK --total-quantity 6 --count 3` |
+| `scale SYMBOL QTY START END COUNT` | Ladder limit orders across price range | `z scale INFY 15 995 1000 3` |
+| `chase SYMBOL QTY PRICE MAX_MOVES TICK` | Place + chase a limit order | `z chase RELIANCE 5 2460 10 0.1` |
 
-## GTT management (requires `--live`)
+## Blotters & utilities
 
-GTT operations hit Zerodha servers and are blocked in dry-run mode.
+| Command | Description |
+| --- | --- |
+| `orders` | List open Kite orders (simulated or live) |
+| `pos` | Show current positions; simulated fills are tracked during dry-runs |
+| `history [N]` | Print the last `N` orders acknowledged in this session (default 10) |
+| `help` | Summarise the command set |
+| `quit` | Exit the interactive shell |
 
-```bash
-zerodhacli --live gtt single HDFCBANK --trigger 1500 --limit-price 1495 --quantity 1
-zerodhacli --live gtt list
-zerodhacli --live gtt delete 123456
+Each execution emits two log lines in either `SIM` or `LIVE` mode. Example:
+
+```
+[2025-10-03 10:21:03] SIM SCALE BUY 15 INFY between 995-1000 (3 legs) -> order_ids=['DRY-aaa', 'DRY-bbb', 'DRY-ccc']
+status=dry-run
 ```
 
-## Configuration
+Integrity status is checked every time the CLI launches. If the stored config
+hash changes or credentials are missing in live mode, the heading prints a
+`WARN` tag so you can resolve issues before trading.
 
-Use `zerodhacli config` to inspect the active settings. The config is persisted at
-`~/.config/zerodhacli/config.json` and mirrors `.env` credentials. Toggle the
-mode by relaunching the CLI with `--dry-run` (default) or `--live`.
+### Reading the blotter
 
-## Tips
+`pos` shows the latest mark price (queried via the Kite quote API in live mode),
+the unrealised PnL calculated from the position's average price, and the day's
+running PnL from Zerodha. Totals are summarised at the bottom so you can glance
+at per-instrument and portfolio PnL without leaving the shell.
 
-- Order IDs prefixed with `DRY-` are simulations. Live IDs are returned exactly
-  as Kite provides them.
-- Commands share pacing and rate-limit awareness; even in dry-run they model the
-  cadence you will see in production.
-- For repeated experiments, consider clearing prior dry-run orders with
-  `zerodhacli cancel --all` before running another scenario.
+Auto-slicing is disabled by default; enable it by setting `"autoslice": true`
+in `~/.config/zerodhacli/config.json` if your instrument supports it.

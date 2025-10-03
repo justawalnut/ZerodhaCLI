@@ -11,6 +11,7 @@ from .order_router import OrderRouter
 from .portfolio import PortfolioService
 from .gtt_manager import GTTManager
 from .ticker import TickerService
+from .quote import QuoteService
 
 
 @dataclass(slots=True)
@@ -23,6 +24,7 @@ class ServiceContainer:
     portfolio: PortfolioService
     gtt: GTTManager
     ticker: TickerService
+    quotes: QuoteService
 
     @classmethod
     def build(cls, config: Optional[AppConfig] = None) -> "ServiceContainer":
@@ -32,7 +34,8 @@ class ServiceContainer:
         orders = OrderRouter(cfg, client, portfolio)
         gtt = GTTManager(client)
         ticker = TickerService(cfg, client)
-        return cls(config=cfg, client=client, orders=orders, portfolio=portfolio, gtt=gtt, ticker=ticker)
+        quotes = QuoteService(client)
+        return cls(config=cfg, client=client, orders=orders, portfolio=portfolio, gtt=gtt, ticker=ticker, quotes=quotes)
 
     async def bootstrap(self) -> None:
         """Start background services required for interactive usage."""
