@@ -14,7 +14,7 @@ import httpx
 from rich.console import Console
 
 from ..core.config import AppConfig
-from ..core.models import OrderRequest, OrderType, Position, Product, Validity, Variety
+from ..core.models import OrderRequest, OrderResponse, OrderType, Position, Product, Validity, Variety
 from ..services.container import ServiceContainer
 from ..utils.integrity import IntegrityReport, perform_integrity_check
 
@@ -193,10 +193,17 @@ class CommandDispatcher:
             positions = self.services.orders.simulated_positions()
         else:
             positions = _run(self.services.portfolio.positions())
+        positions = [position for position in positions if position.quantity != 0]
         match = self._select_position(positions, symbol)
         if match is None:
             raise CommandError(f"No open position for {symbol}")
-        response = _run(self.services.orders.close_position(match))
+        try:
+            response = _run(self.services.orders.close_position(match))
+        except ValueError as exc:
+            if str(exc) != "Position already flat":
+                raise
+            console.print(f"[yellow]Warning[/yellow]: {exc}")
+            return 0
         preview = OrderRequest(
             tradingsymbol=match.tradingsymbol,
             exchange=match.exchange,
@@ -301,7 +308,7 @@ class CommandDispatcher:
                 _run(self.services.quotes.enrich_positions(positions, force=True))
             except httpx.HTTPError as exc:
                 console.print(f"[yellow]Warning[/yellow]: quote lookup failed ({exc}).")
-        positions = list(positions)
+        positions = [position for position in positions if position.quantity != 0]
         ts = _timestamp()
         mode = _mode_tag(self.services.config)
         console.print(f"[{ts}] {mode} POSITIONS:")
@@ -417,13 +424,20 @@ class CommandDispatcher:
             autoslice=autoslice,
         )
 
-    def _render_order(self, order: OrderRequest, response) -> None:
+    def _render_order(
+        self,
+        order: OrderRequest,
+        response: OrderResponse,
+        *,
+        extra: Optional[str] = None,
+    ) -> None:
         ts = _timestamp()
         mode = _mode_tag(self.services.config)
         price = _format_price(order.order_type, order.price)
         trigger = _format_trigger(order.trigger_price)
+        suffix = f" {extra}" if extra else ""
         console.print(
-            f"[{ts}] {mode} {order.transaction_type} {order.quantity} {order.tradingsymbol} {price}{trigger} -> order_id={response.order_id}"
+            f"[{ts}] {mode} {order.transaction_type} {order.quantity} {order.tradingsymbol} {price}{trigger}{suffix} -> order_id={response.order_id}"
         )
         console.print(f"status={response.status}")
 
