@@ -2,21 +2,24 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import shlex
 import sys
+import uuid
 import atexit
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Sequence, Tuple
 
 import httpx
 from rich.console import Console
 
 from ..core.config import AppConfig
-from ..core.models import OrderRequest, OrderResponse, OrderType, Position, Product, Validity, Variety
+from ..core.models import OrderRequest, OrderResponse, OrderType, Position, Product, Validity, Variety, OrderSummary
 from ..services.container import ServiceContainer
 from ..utils.integrity import IntegrityReport, perform_integrity_check
+from ..services.order_index import OrderMetadata
 
 console = Console()
 
@@ -116,6 +119,43 @@ class CliSession:
         _run(self.services.aclose())
 
 
+@dataclass(slots=True)
+class IndexedOrder:
+    summary: OrderSummary
+    metadata: OrderMetadata
+
+    @property
+    def order_id(self) -> str:
+        return self.summary.order_id
+
+    @property
+    def role(self) -> Optional[str]:
+        return self.metadata.role
+
+    @property
+    def group(self) -> Optional[str]:
+        return self.metadata.group
+
+    @property
+    def strategy_id(self) -> Optional[str]:
+        return self.metadata.strategy_id
+
+    @property
+    def protected(self) -> bool:
+        return bool(self.metadata.protected)
+
+    @property
+    def created_at(self) -> datetime:
+        base = self.metadata.created_at or self.summary.order_timestamp
+        if base.tzinfo is None:
+            return base.replace(tzinfo=timezone.utc)
+        return base
+
+    @property
+    def age_seconds(self) -> float:
+        now = datetime.now(timezone.utc)
+        return max((now - self.created_at).total_seconds(), 0.0)
+
 class CommandDispatcher:
     """Parse and execute trading commands."""
 
@@ -142,21 +182,23 @@ class CommandDispatcher:
 
     def do_help(self, _: Sequence[str]) -> int:
         console.print(
-            "Available commands: buy, sell, sl, close, cancel, scale, chase, orders, pos, history, help, quit"
+            "Available commands: buy, sell, sl, close, cancel, cancel where, cancel ladder, cancel nonessential, scale, chase, orders, pos, history, help, quit"
         )
         console.print("Use --dry-run or --live when launching to toggle mode. Ctrl+D or 'quit' exits.")
         return 0
 
     def do_buy(self, args: Sequence[str]) -> int:
         symbol, qty, order_type, price = self._parse_basic_order_args(args, "buy")
-        order = self._build_order(symbol, qty, "BUY", order_type, price)
+        metadata = self._compose_metadata(symbol, role="entry")
+        order = self._build_order(symbol, qty, "BUY", order_type, price, metadata=metadata)
         response = _run(self.services.orders.place_order(order))
         self._render_order(order, response)
         return 0
 
     def do_sell(self, args: Sequence[str]) -> int:
         symbol, qty, order_type, price = self._parse_basic_order_args(args, "sell")
-        order = self._build_order(symbol, qty, "SELL", order_type, price)
+        metadata = self._compose_metadata(symbol, role="entry")
+        order = self._build_order(symbol, qty, "SELL", order_type, price, metadata=metadata)
         response = _run(self.services.orders.place_order(order))
         self._render_order(order, response)
         return 0
@@ -169,6 +211,7 @@ class CommandDispatcher:
         trigger = self._parse_float(args[2], "trigger")
         price = self._parse_optional_float(args[3]) if len(args) > 3 else None
         order_type = OrderType.SL if price is not None else OrderType.SL_M
+        metadata = self._compose_metadata(symbol, role="stop_loss", protected=True)
         order = OrderRequest(
             tradingsymbol=symbol,
             exchange=DEFAULT_EXCHANGE,
@@ -180,6 +223,7 @@ class CommandDispatcher:
             trigger_price=trigger,
             validity=Validity.DAY,
             variety=Variety.REGULAR,
+            metadata=metadata,
         )
         response = _run(self.services.orders.place_order(order))
         self._render_order(order, response)
@@ -219,7 +263,15 @@ class CommandDispatcher:
         if not args:
             raise CommandError("Usage: cancel ORDERID | cancel all")
         open_orders = _run(self.services.orders.list_open_orders())
-        if len(args) == 1 and args[0].lower() == "all":
+        command = args[0].lower()
+        if command == "where":
+            return self._cancel_where(args[1:])
+        if command == "ladder":
+            return self._cancel_ladder(args[1:])
+        if command == "nonessential":
+            return self._cancel_nonessential(args[1:])
+        open_orders = _run(self.services.orders.list_open_orders())
+        if len(args) == 1 and command == "all":
             if not open_orders:
                 console.print("No open orders to cancel.")
                 return 0
@@ -241,6 +293,8 @@ class CommandDispatcher:
         start = self._parse_float(args[2], "start")
         end = self._parse_float(args[3], "end")
         count = self._parse_int(args[4], "count", minimum=1)
+        group = f"ladder:{symbol}:{uuid.uuid4().hex[:8]}"
+        metadata = self._compose_metadata(symbol, role="entry", group=group)
         template = OrderRequest(
             tradingsymbol=symbol,
             exchange=DEFAULT_EXCHANGE,
@@ -250,6 +304,7 @@ class CommandDispatcher:
             product=self.default_product,
             validity=Validity.DAY,
             autoslice=self.services.config.autoslice or None,
+            metadata=metadata,
         )
         responses = _run(self.services.orders.scale_order(template, count, start, end))
         self._render_scale(template, responses, start, end, count)
@@ -263,6 +318,7 @@ class CommandDispatcher:
         price = self._parse_float(args[2], "price")
         max_moves = self._parse_int(args[3], "max_moves", minimum=1)
         tick = self._parse_float(args[4], "tick")
+        metadata = self._compose_metadata(symbol, role="entry")
         order = OrderRequest(
             tradingsymbol=symbol,
             exchange=DEFAULT_EXCHANGE,
@@ -272,6 +328,7 @@ class CommandDispatcher:
             product=self.default_product,
             price=price,
             autoslice=self.services.config.autoslice or None,
+            metadata=metadata,
         )
         response = _run(
             self.services.orders.chase_order(
@@ -401,6 +458,22 @@ class CommandDispatcher:
             return None
         return self._parse_float(token, "price")
 
+    def _compose_metadata(
+        self,
+        symbol: str,
+        *,
+        role: str,
+        protected: bool = False,
+        group: Optional[str] = None,
+        strategy_id: Optional[str] = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {"symbol": symbol, "role": role, "protected": protected}
+        if group:
+            payload["group"] = group
+        if strategy_id:
+            payload["strategy_id"] = strategy_id
+        return payload
+
     def _build_order(
         self,
         symbol: str,
@@ -408,8 +481,13 @@ class CommandDispatcher:
         side: str,
         order_type: OrderType,
         price: Optional[float],
+        *,
+        metadata: Optional[dict[str, object]] = None,
     ) -> OrderRequest:
         autoslice = self.services.config.autoslice if self.services.config.autoslice else None
+        metadata_payload: dict[str, object] = {"symbol": symbol, "role": "entry", "protected": False}
+        if metadata:
+            metadata_payload.update(metadata)
         return OrderRequest(
             tradingsymbol=symbol,
             exchange=DEFAULT_EXCHANGE,
@@ -422,6 +500,7 @@ class CommandDispatcher:
             variety=Variety.REGULAR,
             market_protection=self.services.config.market_protection,
             autoslice=autoslice,
+            metadata=metadata_payload,
         )
 
     def _render_order(
@@ -468,6 +547,136 @@ class CommandDispatcher:
         status_text = statuses.pop() if len(statuses) == 1 else str(list(statuses))
         console.print(f"status={status_text}")
 
+    def _cancel_where(self, args: Sequence[str]) -> int:
+        tokens, include_protected, confirm = self._parse_cancel_flags(args)
+        expression = " ".join(tokens).strip()
+        if not expression:
+            raise CommandError("Usage: cancel where <expression> [--include-protected] [--confirm]")
+        indexed = self._indexed_orders()
+        matches = [order for order in indexed if self._evaluate_expression(expression, order)]
+        return self._execute_cancel(matches, include_protected, confirm)
+
+    def _cancel_ladder(self, args: Sequence[str]) -> int:
+        tokens, include_protected, confirm = self._parse_cancel_flags(args)
+        if not tokens:
+            raise CommandError("Usage: cancel ladder SYMBOL [--include-protected] [--confirm]")
+        symbol = tokens[0]
+        indexed = self._indexed_orders()
+        matches = [order for order in indexed if order.summary.tradingsymbol == symbol]
+        return self._execute_cancel(matches, include_protected, confirm)
+
+    def _cancel_nonessential(self, args: Sequence[str]) -> int:
+        tokens, include_protected, confirm = self._parse_cancel_flags(args)
+        strategy_id = None
+        filtered_tokens: List[str] = []
+        iterator = iter(tokens)
+        for token in iterator:
+            if token == "--strategy":
+                try:
+                    strategy_id = next(iterator)
+                except StopIteration as exc:  # pragma: no cover - defensive
+                    raise CommandError("--strategy expects an identifier") from exc
+                continue
+            filtered_tokens.append(token)
+        if filtered_tokens:
+            raise CommandError("Usage: cancel nonessential [--strategy ID] [--include-protected] [--confirm]")
+        indexed = self._indexed_orders()
+        matches = [order for order in indexed if not strategy_id or order.strategy_id == strategy_id]
+        return self._execute_cancel(matches, include_protected, confirm)
+
+    def _indexed_orders(self) -> List[IndexedOrder]:
+        summaries = _run(self.services.orders.list_open_orders())
+        metadata_map = self.services.index.bulk_fetch(order.order_id for order in summaries)
+        indexed: List[IndexedOrder] = []
+        for summary in summaries:
+            metadata = metadata_map.get(summary.order_id)
+            if metadata is None:
+                created = summary.order_timestamp
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                metadata = OrderMetadata(
+                    order_id=summary.order_id,
+                    role=None,
+                    group=None,
+                    strategy_id=None,
+                    protected=False,
+                    symbol=summary.tradingsymbol,
+                    created_at=created,
+                )
+            else:
+                if metadata.created_at is None:
+                    created = summary.order_timestamp
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
+                    metadata.created_at = created
+                if not metadata.symbol:
+                    metadata.symbol = summary.tradingsymbol
+            indexed.append(IndexedOrder(summary=summary, metadata=metadata))
+        return indexed
+
+    def _parse_cancel_flags(self, tokens: Sequence[str]) -> Tuple[List[str], bool, bool]:
+        include_protected = False
+        confirm = False
+        filtered: List[str] = []
+        for token in tokens:
+            if token == "--include-protected":
+                include_protected = True
+            elif token == "--confirm":
+                confirm = True
+            else:
+                filtered.append(token)
+        return filtered, include_protected, confirm
+
+    def _execute_cancel(
+        self,
+        orders: Sequence[IndexedOrder],
+        include_protected: bool,
+        confirm: bool,
+    ) -> int:
+        if not orders:
+            console.print("No matching open orders.")
+            return 0
+        protected = [order for order in orders if order.protected]
+        targets = list(orders)
+        if not include_protected:
+            targets = [order for order in targets if not order.protected]
+            if protected:
+                console.print(
+                    f"[yellow]Skipping {len(protected)} protected orders.[/yellow] Use --include-protected --confirm to override."
+                )
+        if include_protected and protected and not confirm:
+            raise CommandError("Cancelling protected legs requires --confirm.")
+        if not targets:
+            console.print("No matching open orders.")
+            return 0
+        ordered = sorted(targets, key=lambda order: order.created_at, reverse=True)
+        console.print(f"Cancelling {len(ordered)} orders:")
+        for order in ordered:
+            console.print(
+                f"- {order.order_id} {order.summary.tradingsymbol} qty={order.summary.quantity} role={order.role or '--'} status={order.summary.status}"
+            )
+        payload = [(order.order_id, order.summary.variety) for order in ordered]
+        responses = _run(self.services.orders.cancel_orders(payload))
+        self._render_cancelled(responses)
+        return 0
+
+    def _evaluate_expression(self, expression: str, order: IndexedOrder) -> bool:
+        context = {
+            "age": order.age_seconds,
+            "role": order.role,
+            "group": order.group,
+            "strategy_id": order.strategy_id,
+            "protected": order.protected,
+            "symbol": order.summary.tradingsymbol,
+            "status": order.summary.status,
+            "quantity": order.summary.quantity,
+        }
+        evaluator = _SafeExpressionEvaluator(context)
+        try:
+            return evaluator.evaluate(expression)
+        except ValueError as exc:
+            raise CommandError(f"Invalid expression: {exc}") from exc
+
     def _select_position(self, positions: Sequence[Position], token: str) -> Optional[Position]:
         token_upper = token.upper()
         if ":" in token_upper:
@@ -495,6 +704,103 @@ def _extract_mode_override(argv: Sequence[str]) -> Tuple[Optional[bool], List[st
             return dry_run_override, ["help"]
         remaining.append(arg)
     return dry_run_override, remaining
+
+
+class _SafeExpressionEvaluator(ast.NodeVisitor):
+    """Safely evaluate boolean expressions over a restricted context."""
+
+    def __init__(self, context: dict) -> None:
+        self._context = context
+
+    def evaluate(self, expression: str) -> bool:
+        try:
+            tree = ast.parse(expression, mode="eval")
+        except SyntaxError as exc:  # pragma: no cover - syntax errors handled uniformly
+            raise ValueError(str(exc)) from exc
+        result = self.visit(tree.body)
+        return bool(result)
+
+    def visit_BoolOp(self, node: ast.BoolOp):
+        if isinstance(node.op, ast.And):
+            return all(self.visit(value) for value in node.values)
+        if isinstance(node.op, ast.Or):
+            return any(self.visit(value) for value in node.values)
+        raise ValueError("Unsupported boolean operator")
+
+    def visit_UnaryOp(self, node: ast.UnaryOp):
+        operand = self.visit(node.operand)
+        if isinstance(node.op, ast.Not):
+            return not operand
+        if isinstance(node.op, ast.USub):
+            return -operand
+        if isinstance(node.op, ast.UAdd):
+            return +operand
+        raise ValueError("Unsupported unary operator")
+
+    def visit_BinOp(self, node: ast.BinOp):
+        left = self.visit(node.left)
+        right = self.visit(node.right)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, ast.Div):
+            return left / right
+        if isinstance(node.op, ast.Mod):
+            return left % right
+        raise ValueError("Unsupported binary operator")
+
+    def visit_Compare(self, node: ast.Compare):
+        left = self.visit(node.left)
+        for operator, comparator in zip(node.ops, node.comparators):
+            right = self.visit(comparator)
+            if isinstance(operator, ast.Eq):
+                ok = left == right
+            elif isinstance(operator, ast.NotEq):
+                ok = left != right
+            elif isinstance(operator, ast.Gt):
+                ok = left > right
+            elif isinstance(operator, ast.GtE):
+                ok = left >= right
+            elif isinstance(operator, ast.Lt):
+                ok = left < right
+            elif isinstance(operator, ast.LtE):
+                ok = left <= right
+            elif isinstance(operator, ast.In):
+                ok = left in right
+            elif isinstance(operator, ast.NotIn):
+                ok = left not in right
+            else:
+                raise ValueError("Unsupported comparison operator")
+            if not ok:
+                return False
+            left = right
+        return True
+
+    def visit_Name(self, node: ast.Name):
+        if node.id not in self._context:
+            raise ValueError(f"Unknown name '{node.id}'")
+        return self._context[node.id]
+
+    def visit_Constant(self, node: ast.Constant):
+        return node.value
+
+    def visit_List(self, node: ast.List):
+        return [self.visit(elt) for elt in node.elts]
+
+    def visit_Tuple(self, node: ast.Tuple):
+        return tuple(self.visit(elt) for elt in node.elts)
+
+    def visit_Set(self, node: ast.Set):
+        return {self.visit(elt) for elt in node.elts}
+
+    def visit_Dict(self, node: ast.Dict):
+        return {self.visit(key): self.visit(value) for key, value in zip(node.keys, node.values)}
+
+    def generic_visit(self, node: ast.AST):  # pragma: no cover - defensive
+        raise ValueError(f"Unsupported expression element: {type(node).__name__}")
 
 
 def run_cli(argv: Optional[Sequence[str]] = None) -> int:

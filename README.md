@@ -8,7 +8,7 @@ Launch `z` to drop into an interactive shell that accepts fast trading mnemonics
 
 - Interactive shell (`z>`) with one-liners and a help summary
 - Dry-run mode for safe practice; live mode for real orders
-- Market/limit/SL/SL-M entries, position close, selective cancel
+- Market/limit/SL/SL-M entries, position close, selective cancel (ID/all/predicate/ladder/nonessential)
 - Execution helpers: price laddering (`scale`) and limit chasing (`chase`)
 - Blotters: open orders, positions with live marks, local history
 - Config persistence under `~/.config/zerodhacli/config.json`
@@ -50,6 +50,12 @@ Config keys and defaults:
 - `autoslice`: `false` (let Kite auto-slice large orders when supported)
 - `throttle_warning_threshold`: `0.8` (warn near rate limits)
 
+A lightweight shadow index of acknowledged orders lives beside the config as
+`~/.config/zerodhacli/state.db`. It stores roles/strategy tags/protected flags so
+`cancel where`, `cancel ladder`, and `cancel nonessential` can skip stop-loss /
+hedge legs by default. The index is updated on each placement/cancel and is safe
+to delete if you need to reset metadata.
+
 Example:
 
 ```json
@@ -72,7 +78,7 @@ Interactive usage and command examples are documented in `docs/USAGE.md`. Highli
 - Entries: `buy SYMBOL QTY [@PRICE]`, `sell SYMBOL QTY [@PRICE]`
 - Stop-loss: `sl SYMBOL QTY TRIGGER [PRICE]` (omit PRICE for SL-M)
 - Close: `close SYMBOL` (accepts `EXCHANGE:SYMBOL` or `SYMBOL`)
-- Cancel: `cancel ORDERID` or `cancel all`
+- Cancel: `cancel ORDERID`, `cancel all`, predicate cancel (`cancel where`), ladder drain (`cancel ladder SYMBOL`), or clear loose legs (`cancel nonessential`)
 - Ladder: `scale SYMBOL QTY START END COUNT`
 - Chase: `chase SYMBOL QTY PRICE MAX_MOVES TICK`
 - Blotters: `orders`, `pos`, `history [N]`, plus `help`, `quit`

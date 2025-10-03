@@ -1,9 +1,12 @@
 import asyncio
+from pathlib import Path
 
 from zerodhacli.core.config import AppConfig, KiteCredentials
 from zerodhacli.core.models import OrderRequest, OrderType, Product
+
 from zerodhacli.services.order_router import OrderRouter
 from zerodhacli.services.portfolio import PortfolioService
+from zerodhacli.services.order_index import OrderIndex
 
 
 class MockClient:
@@ -40,7 +43,8 @@ def _router(client: MockClient | None = None, dry_run: bool = False) -> OrderRou
     config = AppConfig(creds=KiteCredentials(), dry_run=dry_run)
     client = client or MockClient()
     portfolio = PortfolioService(client)  # type: ignore[arg-type]
-    return OrderRouter(config, client, portfolio)  # type: ignore[arg-type]
+    index = OrderIndex(Path(":memory:"))
+    return OrderRouter(config, client, portfolio, index)  # type: ignore[arg-type]
 
 
 def test_place_order_uses_client_response():
@@ -62,6 +66,29 @@ def test_place_order_uses_client_response():
     assert response.order_id == "MOCK-1"
     assert client.last_payload["exchange"] == "NFO"
     assert client.last_payload["order_type"] == OrderType.MARKET.value
+
+
+def test_place_order_records_metadata():
+    client = MockClient()
+    router = _router(client)
+
+    order = OrderRequest(
+        tradingsymbol="TEST",
+        exchange="NFO",
+        transaction_type="BUY",
+        quantity=1,
+        order_type=OrderType.MARKET,
+        product=Product.MIS,
+        metadata={"role": "entry", "protected": False, "symbol": "TEST"},
+    )
+
+    response = asyncio.run(router.place_order(order))
+
+    index = router._index  # type: ignore[attr-defined]
+    meta = index.bulk_fetch([response.order_id])[response.order_id]
+    assert meta.role == "entry"
+    assert meta.symbol == "TEST"
+    assert meta.protected is False
 
 
 def test_filter_and_cancel_orders_against_mock_payload():

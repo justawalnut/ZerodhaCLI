@@ -12,6 +12,7 @@ from .portfolio import PortfolioService
 from .gtt_manager import GTTManager
 from .ticker import TickerService
 from .quote import QuoteService
+from .order_index import OrderIndex
 
 
 @dataclass(slots=True)
@@ -21,6 +22,7 @@ class ServiceContainer:
     config: AppConfig
     client: KiteRESTClient
     orders: OrderRouter
+    index: OrderIndex
     portfolio: PortfolioService
     gtt: GTTManager
     ticker: TickerService
@@ -31,11 +33,21 @@ class ServiceContainer:
         cfg = config or AppConfig.load()
         client = KiteRESTClient(cfg)
         portfolio = PortfolioService(client)
-        orders = OrderRouter(cfg, client, portfolio)
+        index = OrderIndex()
+        orders = OrderRouter(cfg, client, portfolio, index)
         gtt = GTTManager(client)
         ticker = TickerService(cfg, client)
         quotes = QuoteService(client)
-        return cls(config=cfg, client=client, orders=orders, portfolio=portfolio, gtt=gtt, ticker=ticker, quotes=quotes)
+        return cls(
+            config=cfg,
+            client=client,
+            orders=orders,
+            portfolio=portfolio,
+            gtt=gtt,
+            ticker=ticker,
+            quotes=quotes,
+            index=index,
+        )
 
     async def bootstrap(self) -> None:
         """Start background services required for interactive usage."""
@@ -51,3 +63,4 @@ class ServiceContainer:
 
         await self.client.aclose()
         await self.ticker.aclose()
+        self.index.close()
