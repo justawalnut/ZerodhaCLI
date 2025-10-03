@@ -24,6 +24,9 @@ that shell or directly after the `z` binary.
 | `sl SYMBOL QTY TRIGGER [PRICE]` | Stop-loss; skip PRICE for SL-M | `z sl HDFCBANK 1 1490 1491` |
 | `close SYMBOL` | Flatten open position; accepts `NSE:HDFCBANK` or `HDFCBANK` | `z close BANKNIFTY24OCTFUT` |
 | `cancel ORDERID` / `cancel all` | Cancel single order or everything open | `z cancel DRY-123abc` |
+| `cancel where "expr"` | Predicate cancel using `age`, `role`, `group`, `symbol`, `status`, `protected`, `strategy_id` | `z cancel where "symbol == 'INFY' and age > 30"` |
+| `cancel ladder SYMBOL` | Nuke ladders/buckets for a symbol (skips protected legs unless forced) | `z cancel ladder INFY` |
+| `cancel nonessential [--strategy ID]` | Cancel all non-protected legs, optionally scoped to a strategy | `z cancel nonessential --strategy swing` |
 
 ## Execution algos
 
@@ -59,6 +62,12 @@ hash changes or credentials are missing in live mode, the heading prints a
 the unrealised PnL calculated from the position's average price, and the day's
 running PnL from Zerodha. Totals are summarised at the bottom so you can glance
 at per-instrument and portfolio PnL without leaving the shell.
+
+A local SQLite index (`~/.config/zerodhacli/state.db`) keeps track of order
+roles/groups/strategy tags. Protected roles (stop-loss/take-profit/hedge) are
+flagged so `cancel where`, `cancel ladder`, and `cancel nonessential` ignore
+them by default. To force-cancel protected legs you must provide both
+`--include-protected` and `--confirm` on the relevant command.
 
 Auto-slicing is disabled by default; enable it by setting `"autoslice": true`
 in `~/.config/zerodhacli/config.json` if your instrument supports it.

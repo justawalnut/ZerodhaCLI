@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 
 CONFIG_DIR = Path(os.environ.get("ZERODHACLI_CONFIG_DIR", Path.home() / ".config" / "zerodhacli"))
 CONFIG_FILE = CONFIG_DIR / "config.json"
+STATE_DB = CONFIG_DIR / "state.db"
 
 
 @dataclass(slots=True)

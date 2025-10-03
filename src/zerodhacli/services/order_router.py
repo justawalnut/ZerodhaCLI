@@ -6,7 +6,7 @@ import asyncio
 import itertools
 import uuid
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
 import json
@@ -25,6 +25,7 @@ from ..core.models import (
 from ..core.rate_limit import AsyncRateLimiter
 from .kite_client import KiteRESTClient
 from .portfolio import PortfolioService
+from .order_index import OrderIndex
 
 
 @dataclass(slots=True)
@@ -70,7 +71,13 @@ class _SimPosition:
 class OrderRouter:
     """Places and manages orders while respecting config and rate limits."""
 
-    def __init__(self, config: AppConfig, client: KiteRESTClient, portfolio: PortfolioService) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        client: KiteRESTClient,
+        portfolio: PortfolioService,
+        index: OrderIndex,
+    ) -> None:
         self._config = config
         self._client = client
         self._portfolio = portfolio
@@ -78,6 +85,7 @@ class OrderRouter:
         self._dry_orders: dict[str, _DryOrderRecord] = {}
         self._history: list[ExecutionRecord] = []
         self._sim_positions: dict[str, _SimPosition] = {}
+        self._index = index
 
     async def _throttle(self) -> None:
         if not self._config.dry_run:
@@ -87,18 +95,21 @@ class OrderRouter:
         """Place a new order via Kite REST."""
 
         await self._throttle()
+        created_at = datetime.now(timezone.utc)
         if self._config.dry_run:
             order_id = f"DRY-{uuid.uuid4().hex[:12]}"
-            record = _DryOrderRecord(request=order, created_at=datetime.utcnow())
+            record = _DryOrderRecord(request=order, created_at=created_at)
             self._dry_orders[order_id] = record
             response = OrderResponse(order_id=order_id, status="dry-run")
             self._record_execution(order, response)
             self._update_sim_position(order)
+            self._record_index(order_id, order, created_at)
             return response
         payload = self._serialize(asdict(order))
         data = await self._client.post("/orders/regular", payload)
         response = OrderResponse(order_id=data.get("data", {}).get("order_id", ""), status=data.get("status", ""))
         self._record_execution(order, response)
+        self._record_index(response.order_id, order, created_at)
         return response
 
     async def modify_order(self, order_id: str, updates: dict) -> OrderResponse:
@@ -132,6 +143,7 @@ class OrderRouter:
                 continue
             parsed.append((str(item), None))
 
+        successful: list[str] = []
         for order_id, variety in parsed:
             await self._throttle()
             if self._config.dry_run:
@@ -139,10 +151,18 @@ class OrderRouter:
                     self._dry_orders[order_id].status = "CANCELLED"
                     del self._dry_orders[order_id]
                 responses.append(OrderResponse(order_id=order_id, status="dry-run"))
+                successful.append(order_id)
                 continue
             variety_token = self._variety_token(variety)
             data = await self._client.delete(f"/orders/{variety_token}/{order_id}")
             responses.append(OrderResponse(order_id=order_id, status=data.get("status", "")))
+            if data.get("status") == "success":
+                successful.append(order_id)
+        if successful:
+            try:
+                self._index.purge(successful)
+            except Exception:  # pragma: no cover - defensive cleanup
+                pass
         return responses
 
     async def recent_history(self, limit: int = 10) -> List[ExecutionRecord]:
@@ -208,6 +228,11 @@ class OrderRouter:
             product=position.product,
             market_protection=self._config.market_protection,
             autoslice=self._config.autoslice or None,
+            metadata={
+                "symbol": position.tradingsymbol,
+                "role": "exit",
+                "protected": False,
+            },
         )
         return await self.place_order(order)
 
@@ -273,6 +298,28 @@ class OrderRouter:
             responses.append(await self.place_order(order))
             await asyncio.sleep(delay)
         return responses
+
+    def _record_index(self, order_id: str, order: OrderRequest, created_at: datetime) -> None:
+        if not order_id:
+            return
+        metadata = order.metadata or {}
+        protected = bool(metadata.get("protected", False))
+        role = metadata.get("role")
+        group = metadata.get("group")
+        strategy_id = metadata.get("strategy_id")
+        symbol = metadata.get("symbol") or order.tradingsymbol
+        try:
+            self._index.record(
+                order_id,
+                role=role,
+                group=group,
+                strategy_id=strategy_id,
+                protected=protected,
+                symbol=symbol,
+                created_at=created_at,
+            )
+        except Exception:  # pragma: no cover - index failures shouldn't break flow
+            pass
 
     async def list_open_orders(self) -> List[OrderSummary]:
         """Return currently open orders for filtering/cancellation."""
@@ -492,6 +539,8 @@ class OrderRouter:
         wire: dict[str, Any] = {}
         for key, value in payload.items():
             if value is None:
+                continue
+            if key == "metadata":
                 continue
             wire[key] = OrderRouter._to_wire(value)
         return wire
