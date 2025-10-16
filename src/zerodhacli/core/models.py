@@ -95,6 +95,9 @@ class Position:
     average_price: float
     pnl: float
     last_price: Optional[float] = None
+    day_quantity: Optional[int] = None
+    day_average_price: Optional[float] = None
+    day_pnl: Optional[float] = None
 
 
 @dataclass(slots=True)

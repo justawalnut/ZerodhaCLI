@@ -120,6 +120,50 @@ class CliSession:
 
 
 @dataclass(slots=True)
+class PositionBreakdown:
+    """Computed PnL view for a position."""
+
+    mark: float
+    unrealized: float
+    realized: Optional[float]
+    day: float
+
+
+def _extract_side(tokens: Sequence[str], default: str) -> Tuple[List[str], str]:
+    """Split an optional BUY/SELL side token from the argument tail."""
+
+    if tokens and tokens[-1].lower() in {"buy", "sell"}:
+        return list(tokens[:-1]), tokens[-1].upper()
+    return list(tokens), default.upper()
+
+
+def _compute_position_breakdown(position: Position) -> PositionBreakdown:
+    """Return the realized/unrealized/day PnL split for a position."""
+
+    mark = position.last_price if position.last_price is not None else position.average_price
+    net_unrealized = (mark - position.average_price) * position.quantity
+
+    day_unrealized: Optional[float] = None
+    if position.day_average_price is not None and position.day_quantity is not None:
+        day_unrealized = (mark - position.day_average_price) * position.day_quantity
+
+    unrealized = day_unrealized if day_unrealized is not None else net_unrealized
+
+    if position.day_pnl is not None:
+        day_total = position.day_pnl
+    elif day_unrealized is not None:
+        day_total = day_unrealized
+    else:
+        day_total = net_unrealized
+
+    realized: Optional[float] = None
+    if position.day_pnl is not None and day_unrealized is not None:
+        realized = position.day_pnl - day_unrealized
+
+    return PositionBreakdown(mark=mark, unrealized=unrealized, realized=realized, day=day_total)
+
+
+@dataclass(slots=True)
 class IndexedOrder:
     summary: OrderSummary
     metadata: OrderMetadata
@@ -182,7 +226,7 @@ class CommandDispatcher:
 
     def do_help(self, _: Sequence[str]) -> int:
         console.print(
-            "Available commands: buy, sell, sl, close, cancel, cancel where, cancel ladder, cancel nonessential, scale, chase, orders, pos, history, help, quit"
+            "Available commands: buy, sell, sl, tp, close, cancel, cancel where, cancel ladder, cancel nonessential, scale, chase, orders, pos, history, help, quit"
         )
         console.print("Use --dry-run or --live when launching to toggle mode. Ctrl+D or 'quit' exits.")
         return 0
@@ -204,23 +248,50 @@ class CommandDispatcher:
         return 0
 
     def do_sl(self, args: Sequence[str]) -> int:
-        if len(args) < 3:
-            raise CommandError("Usage: sl SYMBOL QTY TRIGGER [PRICE]")
-        symbol = args[0]
-        quantity = self._parse_quantity(args[1])
-        trigger = self._parse_float(args[2], "trigger")
-        price = self._parse_optional_float(args[3]) if len(args) > 3 else None
+        filtered, side = _extract_side(args, "SELL")
+        if len(filtered) < 3:
+            raise CommandError("Usage: sl SYMBOL QTY TRIGGER [PRICE] [BUY|SELL]")
+        symbol = filtered[0]
+        quantity = self._parse_quantity(filtered[1])
+        trigger = self._parse_float(filtered[2], "trigger")
+        price = self._parse_optional_float(filtered[3]) if len(filtered) > 3 else None
         order_type = OrderType.SL if price is not None else OrderType.SL_M
         metadata = self._compose_metadata(symbol, role="stop_loss", protected=True)
         order = OrderRequest(
             tradingsymbol=symbol,
             exchange=DEFAULT_EXCHANGE,
-            transaction_type="SELL",
+            transaction_type=side,
             quantity=quantity,
             order_type=order_type,
             product=self.default_product,
             price=price,
             trigger_price=trigger,
+            validity=Validity.DAY,
+            variety=Variety.REGULAR,
+            metadata=metadata,
+        )
+        response = _run(self.services.orders.place_order(order))
+        self._render_order(order, response)
+        return 0
+
+    def do_tp(self, args: Sequence[str]) -> int:
+        filtered, side = _extract_side(args, "SELL")
+        if len(filtered) < 3:
+            raise CommandError("Usage: tp SYMBOL QTY PRICE [BUY|SELL]")
+        symbol = filtered[0]
+        quantity = self._parse_quantity(filtered[1])
+        order_type, price = self._parse_price_token(filtered[2])
+        if order_type is not OrderType.LIMIT or price is None:
+            raise CommandError("Take-profit orders must specify a limit price")
+        metadata = self._compose_metadata(symbol, role="take_profit", protected=True)
+        order = OrderRequest(
+            tradingsymbol=symbol,
+            exchange=DEFAULT_EXCHANGE,
+            transaction_type=side,
+            quantity=quantity,
+            order_type=OrderType.LIMIT,
+            product=self.default_product,
+            price=price,
             validity=Validity.DAY,
             variety=Variety.REGULAR,
             metadata=metadata,
@@ -365,7 +436,11 @@ class CommandDispatcher:
                 _run(self.services.quotes.enrich_positions(positions, force=True))
             except httpx.HTTPError as exc:
                 console.print(f"[yellow]Warning[/yellow]: quote lookup failed ({exc}).")
-        positions = [position for position in positions if position.quantity != 0]
+        positions = [
+            position
+            for position in positions
+            if position.quantity != 0 or position.day_pnl is not None
+        ]
         ts = _timestamp()
         mode = _mode_tag(self.services.config)
         console.print(f"[{ts}] {mode} POSITIONS:")
@@ -373,18 +448,26 @@ class CommandDispatcher:
             console.print("None")
             return 0
         total_unrealized = 0.0
+        total_realized = 0.0
         total_day = 0.0
         for position in positions:
-            mark = position.last_price if position.last_price is not None else position.average_price
-            unrealized = (mark - position.average_price) * position.quantity
-            total_unrealized += unrealized
-            total_day += position.pnl
+            breakdown = _compute_position_breakdown(position)
+            total_unrealized += breakdown.unrealized
+            total_day += breakdown.day
+            if breakdown.realized is not None:
+                total_realized += breakdown.realized
             direction = "+" if position.quantity >= 0 else ""
-            mark_display = f"₹{mark:.2f}" if mark is not None else "--"
+            mark_display = f"₹{breakdown.mark:.2f}" if breakdown.mark is not None else "--"
+            if position.day_pnl is not None:
+                day_display = _format_money(position.day_pnl)
+            else:
+                day_display = "~" + _format_money(breakdown.day)
+            realized_display = _format_money(breakdown.realized) if breakdown.realized is not None else "--"
             console.print(
                 f"- {position.exchange}:{position.tradingsymbol}: {direction}{position.quantity} @₹{position.average_price:.2f} "
-                f"mark={mark_display} pnl={_format_money(unrealized)} day={_format_money(position.pnl)}"
+                f"mark={mark_display} unrealized={_format_money(breakdown.unrealized)} realized={realized_display} day={day_display}"
             )
+        console.print(f"Realized PnL: {_format_money(total_realized)}")
         console.print(f"Unrealized PnL: {_format_money(total_unrealized)}")
         console.print(f"Day PnL: {_format_money(total_day)}")
         return 0
