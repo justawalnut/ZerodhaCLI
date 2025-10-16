@@ -127,6 +127,7 @@ class PositionBreakdown:
     unrealized: float
     realized: Optional[float]
     day: float
+    day_is_approximate: bool
 
 
 def _extract_side(tokens: Sequence[str], default: str) -> Tuple[List[str], str]:
@@ -151,16 +152,28 @@ def _compute_position_breakdown(position: Position) -> PositionBreakdown:
 
     if position.day_pnl is not None:
         day_total = position.day_pnl
+        day_is_approximate = False
+    elif position.pnl != 0.0:
+        day_total = position.pnl
+        day_is_approximate = False
     elif day_unrealized is not None:
         day_total = day_unrealized
+        day_is_approximate = True
     else:
         day_total = net_unrealized
+        day_is_approximate = True
 
     realized: Optional[float] = None
     if position.day_pnl is not None and day_unrealized is not None:
         realized = position.day_pnl - day_unrealized
 
-    return PositionBreakdown(mark=mark, unrealized=unrealized, realized=realized, day=day_total)
+    return PositionBreakdown(
+        mark=mark,
+        unrealized=unrealized,
+        realized=realized,
+        day=day_total,
+        day_is_approximate=day_is_approximate,
+    )
 
 
 @dataclass(slots=True)
@@ -450,26 +463,37 @@ class CommandDispatcher:
         total_unrealized = 0.0
         total_realized = 0.0
         total_day = 0.0
+        approximate_day_total = False
         for position in positions:
             breakdown = _compute_position_breakdown(position)
             total_unrealized += breakdown.unrealized
             total_day += breakdown.day
             if breakdown.realized is not None:
                 total_realized += breakdown.realized
-            direction = "+" if position.quantity >= 0 else ""
+            if breakdown.day_is_approximate:
+                approximate_day_total = True
+            quantity = position.quantity
+            quantity_display = f"+{quantity}" if quantity > 0 else str(quantity)
             mark_display = f"₹{breakdown.mark:.2f}" if breakdown.mark is not None else "--"
             if position.day_pnl is not None:
                 day_display = _format_money(position.day_pnl)
+            elif position.pnl != 0.0:
+                day_display = _format_money(position.pnl)
             else:
-                day_display = "~" + _format_money(breakdown.day)
+                day_display = _format_money(breakdown.day)
+            if breakdown.day_is_approximate:
+                day_display = "~" + day_display
             realized_display = _format_money(breakdown.realized) if breakdown.realized is not None else "--"
             console.print(
-                f"- {position.exchange}:{position.tradingsymbol}: {direction}{position.quantity} @₹{position.average_price:.2f} "
+                f"- {position.exchange}:{position.tradingsymbol}: {quantity_display} @₹{position.average_price:.2f} "
                 f"mark={mark_display} unrealized={_format_money(breakdown.unrealized)} realized={realized_display} day={day_display}"
             )
         console.print(f"Realized PnL: {_format_money(total_realized)}")
         console.print(f"Unrealized PnL: {_format_money(total_unrealized)}")
-        console.print(f"Day PnL: {_format_money(total_day)}")
+        day_total_display = _format_money(total_day)
+        if approximate_day_total:
+            day_total_display = "~" + day_total_display
+        console.print(f"Day PnL: {day_total_display}")
         return 0
 
     def do_history(self, args: Sequence[str]) -> int:

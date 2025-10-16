@@ -64,6 +64,7 @@ def test_compute_breakdown_uses_day_metrics():
     assert breakdown.unrealized == pytest.approx((110.0 - 98.0) * 5)
     assert breakdown.realized == pytest.approx(150.0 - (110.0 - 98.0) * 5)
     assert breakdown.day == pytest.approx(150.0)
+    assert breakdown.day_is_approximate is False
 
 
 def test_compute_breakdown_falls_back_to_net_when_day_missing():
@@ -80,6 +81,23 @@ def test_compute_breakdown_falls_back_to_net_when_day_missing():
     assert breakdown.unrealized == pytest.approx((210.0 - 200.0) * 2)
     assert breakdown.realized is None
     assert breakdown.day == pytest.approx((210.0 - 200.0) * 2)
+    assert breakdown.day_is_approximate is True
+
+
+def test_compute_breakdown_uses_position_pnl_when_available():
+    position = Position(
+        tradingsymbol="TCS",
+        exchange="NSE",
+        product=Product.CNC,
+        quantity=3,
+        average_price=3200.0,
+        pnl=45.0,
+        last_price=3215.0,
+    )
+    breakdown = app._compute_position_breakdown(position)
+    assert breakdown.unrealized == pytest.approx((3215.0 - 3200.0) * 3)
+    assert breakdown.day == pytest.approx(45.0)
+    assert breakdown.day_is_approximate is False
 
 
 def test_compute_breakdown_treats_closed_day_position_as_realized():
@@ -99,6 +117,7 @@ def test_compute_breakdown_treats_closed_day_position_as_realized():
     assert breakdown.unrealized == pytest.approx(0.0)
     assert breakdown.realized == pytest.approx(100.0)
     assert breakdown.day == pytest.approx(100.0)
+    assert breakdown.day_is_approximate is False
 
 
 def test_stop_loss_supports_buy_side():
