@@ -55,4 +55,39 @@ def test_positions_deduplicate_day_and_net_entries():
 
     mapping = {f"{p.exchange}:{p.tradingsymbol}": p for p in positions}
     assert mapping["NSE:INFY"].product is Product.MIS
+    assert mapping["NSE:INFY"].day_pnl == 10.0
+    assert mapping["NSE:INFY"].day_quantity == 1
     assert mapping["NSE:GAIL"].quantity == 2
+    assert mapping["NSE:GAIL"].day_pnl is None
+
+
+class DayOnlyClient:
+    async def get(self, path, params=None):
+        assert path == "/portfolio/positions"
+        return {
+            "data": {
+                "day": [
+                    {
+                        "tradingsymbol": "SBIN",
+                        "exchange": "NSE",
+                        "product": "MIS",
+                        "quantity": 0,
+                        "average_price": 600.0,
+                        "pnl": 25.0,
+                        "last_price": 602.0,
+                    }
+                ]
+            }
+        }
+
+
+def test_positions_include_day_only_entries_with_zero_quantity():
+    service = PortfolioService(DayOnlyClient())  # type: ignore[arg-type]
+    positions = asyncio.run(service.positions())
+
+    assert len(positions) == 1
+    position = positions[0]
+    assert position.tradingsymbol == "SBIN"
+    assert position.quantity == 0
+    assert position.day_pnl == 25.0
+    assert position.day_quantity == 0
