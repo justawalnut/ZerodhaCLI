@@ -365,7 +365,11 @@ class CommandDispatcher:
                 _run(self.services.quotes.enrich_positions(positions, force=True))
             except httpx.HTTPError as exc:
                 console.print(f"[yellow]Warning[/yellow]: quote lookup failed ({exc}).")
-        positions = [position for position in positions if position.quantity != 0]
+        positions = [
+            position
+            for position in positions
+            if position.quantity != 0 or position.day_pnl is not None
+        ]
         ts = _timestamp()
         mode = _mode_tag(self.services.config)
         console.print(f"[{ts}] {mode} POSITIONS:")
@@ -373,18 +377,27 @@ class CommandDispatcher:
             console.print("None")
             return 0
         total_unrealized = 0.0
+        total_realized = 0.0
         total_day = 0.0
         for position in positions:
             mark = position.last_price if position.last_price is not None else position.average_price
             unrealized = (mark - position.average_price) * position.quantity
             total_unrealized += unrealized
-            total_day += position.pnl
+            day_pnl_available = position.day_pnl is not None
+            day_pnl = position.day_pnl if day_pnl_available else 0.0
+            total_day += day_pnl
+            realized = (day_pnl - unrealized) if day_pnl_available else None
+            if realized is not None:
+                total_realized += realized
             direction = "+" if position.quantity >= 0 else ""
             mark_display = f"₹{mark:.2f}" if mark is not None else "--"
+            day_display = _format_money(day_pnl) if day_pnl_available else "--"
+            realized_display = _format_money(realized) if realized is not None else "--"
             console.print(
                 f"- {position.exchange}:{position.tradingsymbol}: {direction}{position.quantity} @₹{position.average_price:.2f} "
-                f"mark={mark_display} pnl={_format_money(unrealized)} day={_format_money(position.pnl)}"
+                f"mark={mark_display} unrealized={_format_money(unrealized)} realized={realized_display} day={day_display}"
             )
+        console.print(f"Realized PnL: {_format_money(total_realized)}")
         console.print(f"Unrealized PnL: {_format_money(total_unrealized)}")
         console.print(f"Day PnL: {_format_money(total_day)}")
         return 0
