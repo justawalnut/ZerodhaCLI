@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from zerodhacli.core.config import AppConfig
 
 
